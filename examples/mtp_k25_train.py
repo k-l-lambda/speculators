@@ -45,7 +45,7 @@ from speculators.train.trainer import Trainer, TrainerConfig
 from speculators.train.utils import maybe_destroy_distributed, maybe_setup_distributed
 
 
-VERIFIER_NAME_OR_PATH = "moonshotai/Kimi-K2.5"
+VERIFIER_NAME_OR_PATH = "/data/.cache_claude/huggingface/hub/models--moonshotai--Kimi-K2.5/snapshots/54383e83fa343a1331754112fb9e3410c55efa2f"
 
 
 def parse_args():
@@ -118,7 +118,7 @@ def setup_dataloader(
 
 def main(args):
     # Distributed setup
-    is_distributed, world_size, local_rank = maybe_setup_distributed()
+    local_rank, world_size, rank, is_distributed = maybe_setup_distributed()
 
     # Logging
     setup_root_logger()
@@ -131,7 +131,7 @@ def main(args):
 
     # Load verifier config
     log.info(f"Loading verifier config from {VERIFIER_NAME_OR_PATH}...")
-    verifier_config = AutoConfig.from_pretrained(VERIFIER_NAME_OR_PATH)
+    verifier_config = AutoConfig.from_pretrained(VERIFIER_NAME_OR_PATH, trust_remote_code=True)
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
 
@@ -154,6 +154,9 @@ def main(args):
         freeze_decoder=args.freeze_decoder,
         verifier_layer_idx=args.verifier_layer_idx,
     )
+
+    # Cast model to BF16 to match data dtype
+    draft_model = draft_model.bfloat16()
 
     # Print parameter counts
     total_params = sum(p.numel() for p in draft_model.parameters())
@@ -199,7 +202,7 @@ def main(args):
 
     # Logger
     if local_rank == 0:
-        setup_metric_logger(args.logger, log_dir=log_dir)
+        setup_metric_logger(args.logger, run_name="mtp_k25_smoke", output_dir=log_dir)
 
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
     trainer.run_training()

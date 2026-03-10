@@ -121,7 +121,7 @@ class MTPDraftModel(SpeculatorModel):
         if verifier_cfg.name_or_path is None:
             raise ValueError("VerifierConfig name_or_path is required.")
 
-        verifier_model_config = AutoConfig.from_pretrained(verifier_cfg.name_or_path)
+        verifier_model_config = AutoConfig.from_pretrained(verifier_cfg.name_or_path, trust_remote_code=True)
         if hasattr(verifier_model_config, "text_config"):
             verifier_model_config = verifier_model_config.text_config
 
@@ -199,8 +199,23 @@ class MTPDraftModel(SpeculatorModel):
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
+        # Build 4D causal attention mask required by DeepSeekV3 attention
+        # Shape: [1, 1, seq_len, seq_len], lower-triangular (causal)
+        dtype = fused.dtype
+        causal_mask = torch.full(
+            (1, 1, seq_len, seq_len),
+            fill_value=torch.finfo(dtype).min,
+            dtype=dtype, device=device,
+        )
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        # Lower-triangular = 0 (attend), upper-triangular = -inf (block)
+
         for layer in self.layers:
-            layer_output = layer(fused, position_ids=position_ids)
+            layer_output = layer(
+                fused,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+            )
             if isinstance(layer_output, tuple):
                 fused = layer_output[0]
             else:
@@ -302,7 +317,7 @@ class MTPDraftModel(SpeculatorModel):
 
         # Import DeepSeek modeling code
         config_dir = (
-            Path(__file__).parent.parent.parent.parent
+            Path(__file__).parent.parent.parent.parent.parent
             / "scripts" / "k2_mtp_config"
         )
         if config_dir.exists():
@@ -353,6 +368,16 @@ class MTPDraftModel(SpeculatorModel):
         if freeze:
             for p in decoder_layer.parameters():
                 p.requires_grad = False
+            # Frozen decoder: keep in eval mode (MoE gate asserts not training)
+            decoder_layer.eval()
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Keep frozen decoder layers in eval mode (MoE gate asserts not training)
+        for layer in self.layers:
+            if all(not p.requires_grad for p in layer.parameters()):
+                layer.eval()
+        return self
 
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
