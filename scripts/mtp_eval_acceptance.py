@@ -191,7 +191,7 @@ def load_mtp_state_dict_v3(model_dir, mtp_layer_idx=61, device="cpu"):
     fp8_weights = {}  # base_key -> {weight, scale_inv}
 
     expert_pattern = re.compile(
-        r"mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)"
+        r"mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight_scale_inv|weight)"
     )
 
     for shard_file, keys in sorted(shards.items()):
