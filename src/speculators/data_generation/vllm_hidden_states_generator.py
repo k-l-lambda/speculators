@@ -87,7 +87,7 @@ class VllmHiddenStatesGenerator:
         log.info(f"Initializing hidden states generator for {model_path}")
         log.info(f"Tensor parallel size: {tensor_parallel_size}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if hasattr(config, "num_hidden_layers"):
@@ -268,7 +268,6 @@ class VllmHiddenStatesGenerator:
                     max_tokens=MAX_DECODE_TOKENS, temperature=SAMPLING_TEMPERATURE
                 ),
                 pooling_params=None,
-                eos_token_id=self.tokenizer.eos_token_id,
                 arrival_time=INITIAL_ARRIVAL_TIME,
                 block_hasher=self.block_hasher,
             )
