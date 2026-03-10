@@ -274,3 +274,22 @@ def create_collate_fn(max_len: int):
         return collated_data
 
     return collate_fn
+
+
+
+def standardize_data_mtp(data: dict) -> dict:
+    # MTP data format (single hidden state layer):
+    # {
+    #  'input_ids': [seq_len],
+    #  'loss_mask': [seq_len],
+    #  'hidden_states': [seq_len, hidden_size],   # single tensor (not a list)
+    # }
+    h = data['hidden_states']
+    if isinstance(h, list):
+        h = h[0]
+    return {
+        'hidden_states': h,
+        'input_ids': data['input_ids'],
+        'verifier_last_hidden_states': h,
+        'loss_mask': data['loss_mask'],
+    }
