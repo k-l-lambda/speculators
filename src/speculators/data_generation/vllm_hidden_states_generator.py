@@ -210,6 +210,7 @@ class VllmHiddenStatesGenerator:
             cache_config=cache_config,
             parallel_config=ParallelConfig(
                 tensor_parallel_size=tensor_parallel_size,
+                worker_cls="vllm.v1.worker.gpu_worker.Worker",
                 worker_extension_cls="speculators.data_generation.custom_worker.HiddenStatesWorkerExtension",
             ),
             scheduler_config=SchedulerConfig(
@@ -218,7 +219,7 @@ class VllmHiddenStatesGenerator:
                 max_num_batched_tokens=max_num_batched_tokens,
                 is_encoder_decoder=False,
             ),
-            device_config=DeviceConfig(),
+            device_config=DeviceConfig(device="cuda"),
             load_config=LoadConfig(),
         )
 
