@@ -46,8 +46,8 @@ def parse_args():
         help="Path to mtp.safetensors (INT4 GPTQ quantized)",
     )
     parser.add_argument(
-        "--model-config", type=str, required=True,
-        help="Path to directory with K2.5-MTP config.json and modeling_deepseek.py",
+        "--model-config", type=str, default=None,
+        help="Path to directory with K2.5-MTP config.json and modeling_deepseek.py (default: scripts/k2_mtp_config/)",
     )
     parser.add_argument(
         "--output", type=str, required=True,
@@ -386,6 +386,9 @@ def evaluate_acceptance(model, data_dir, device, output_path):
 def main():
     args = parse_args()
 
+    # Default model-config to bundled k2_mtp_config
+    if args.model_config is None:
+        args.model_config = str(Path(__file__).resolve().parent / "k2_mtp_config")
     log.info("=" * 60)
     log.info("Phase 2: MTP Acceptance Rate Evaluation")
     log.info("=" * 60)
