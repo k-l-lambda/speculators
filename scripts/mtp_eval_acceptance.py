@@ -2,16 +2,22 @@
 """
 Phase 2: Standalone MTP forward pass + acceptance rate computation.
 
-Loads INT4-quantized MTP weights from mtp.safetensors, dequantizes expert
-weights to BF16, builds a standalone MTP layer, and runs teacher-forced
-evaluation against Phase 1 hidden states.
+Supports two weight formats:
+  1. K2.5-MTP: separate mtp.safetensors with INT4 GPTQ quantized experts
+  2. DeepSeek-V3: MTP layer (layer 61) embedded in model shards with FP8 experts
 
-Usage:
+Usage (K2.5):
     python mtp_eval_acceptance.py \
         --data-dir /data/mtp_eval/ \
         --mtp-weights /data/models/Kimi-K2.5-MTP/mtp.safetensors \
         --model-config /data/models/Kimi-K2.5-MTP/ \
         --output /data/mtp_eval/results.json
+
+Usage (V3):
+    python mtp_eval_acceptance.py \
+        --data-dir /data/mtp_eval_v3/ \
+        --model-dir /path/to/DeepSeek-V3/ \
+        --output /data/mtp_eval_v3/results.json
 """
 
 import argparse
@@ -41,13 +47,23 @@ def parse_args():
         "--data-dir", type=str, required=True,
         help="Directory with Phase 1 .pt files",
     )
+    # K2.5 mode: separate mtp.safetensors
     parser.add_argument(
-        "--mtp-weights", type=str, required=True,
-        help="Path to mtp.safetensors (INT4 GPTQ quantized)",
+        "--mtp-weights", type=str, default=None,
+        help="Path to mtp.safetensors (K2.5 INT4 GPTQ mode)",
     )
     parser.add_argument(
         "--model-config", type=str, default=None,
-        help="Path to directory with K2.5-MTP config.json and modeling_deepseek.py (default: scripts/k2_mtp_config/)",
+        help="Path to directory with config.json and modeling_deepseek.py (K2.5 mode)",
+    )
+    # V3 mode: extract MTP from model directory
+    parser.add_argument(
+        "--model-dir", type=str, default=None,
+        help="Path to model directory with safetensors shards (V3 mode)",
+    )
+    parser.add_argument(
+        "--mtp-layer-idx", type=int, default=61,
+        help="MTP layer index in model (default: 61)",
     )
     parser.add_argument(
         "--output", type=str, required=True,
@@ -60,39 +76,56 @@ def parse_args():
     return parser.parse_args()
 
 
-def dequant_int4_gptq(weight_packed, weight_scale, weight_shape, group_size=32):
-    """Dequantize INT4 GPTQ packed weights to BF16.
+# ============================================================
+# Dequantization: INT4 GPTQ (K2.5)
+# ============================================================
 
-    Args:
-        weight_packed: Packed INT4 tensor [out_features, in_features // 8]
-        weight_scale: Per-group scales [out_features, num_groups]
-        weight_shape: Tensor with [out_features, in_features]
-        group_size: Quantization group size
-    """
+def dequant_int4_gptq(weight_packed, weight_scale, weight_shape, group_size=32):
+    """Dequantize INT4 GPTQ packed weights to BF16."""
     out_f = weight_shape[0].item()
     in_f = weight_shape[1].item()
-    PACK_FACTOR = 8  # 8 INT4 values packed per INT32
+    PACK_FACTOR = 8
 
-    # Unpack: extract 8 4-bit values from each int32
     unpacked = [(weight_packed >> (i * 4)) & 0xF for i in range(PACK_FACTOR)]
     w = torch.stack(unpacked, dim=-1).reshape(out_f, -1)[:, :in_f]
-
-    # INT4 is unsigned [0,15], center to signed [-8, 7]
     w_signed = w.float() - 8.0
-
-    # Apply per-group scales
     w_grouped = w_signed.reshape(out_f, -1, group_size)
     scales = weight_scale.float().unsqueeze(-1)
     return (w_grouped * scales).reshape(out_f, -1)[:, :in_f].bfloat16()
 
 
-def load_mtp_state_dict(mtp_weights_path, device="cpu"):
-    """Load and dequantize MTP weights from safetensors.
+# ============================================================
+# Dequantization: FP8 e4m3 with block-wise scales (V3)
+# ============================================================
 
-    Returns a state dict with all weights in BF16, keyed by short names
-    (without "model.layers.61." prefix).
+def dequant_fp8_block(weight_fp8, weight_scale_inv, block_size=128):
+    """Dequantize FP8 e4m3 block-quantized weights to BF16.
+
+    Args:
+        weight_fp8: FP8 tensor [out_features, in_features]
+        weight_scale_inv: Inverse scales per block [ceil(out/block), ceil(in/block)]
+        block_size: Block size for quantization (default: 128)
+    Returns:
+        BF16 tensor [out_features, in_features]
     """
-    log.info(f"Loading MTP weights from {mtp_weights_path}...")
+    out_f, in_f = weight_fp8.shape
+    w = weight_fp8.float()
+
+    # Expand block scales to match weight dimensions
+    scales = weight_scale_inv.float()
+    scales_expanded = scales.repeat_interleave(block_size, dim=0)[:out_f, :]
+    scales_expanded = scales_expanded.repeat_interleave(block_size, dim=1)[:, :in_f]
+
+    return (w * scales_expanded).bfloat16()
+
+
+# ============================================================
+# Weight loading: K2.5 mode (separate mtp.safetensors)
+# ============================================================
+
+def load_mtp_state_dict_k25(mtp_weights_path, device="cpu"):
+    """Load and dequantize K2.5 MTP weights from mtp.safetensors."""
+    log.info(f"Loading K2.5 MTP weights from {mtp_weights_path}...")
     f = safe_open(mtp_weights_path, framework="pt", device=str(device))
     keys = list(f.keys())
     log.info(f"Total keys in mtp.safetensors: {len(keys)}")
@@ -103,8 +136,7 @@ def load_mtp_state_dict(mtp_weights_path, device="cpu"):
         r"mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight_packed|weight_scale|weight_shape)"
     )
 
-    # Group expert quantized weights
-    expert_parts = {}  # (expert_id, proj_name) -> {packed, scale, shape}
+    expert_parts = {}
 
     for key in tqdm(keys, desc="Loading weights"):
         short_key = key.removeprefix(PREFIX)
@@ -118,11 +150,9 @@ def load_mtp_state_dict(mtp_weights_path, device="cpu"):
                 expert_parts[ek] = {}
             expert_parts[ek][part_name] = tensor
         else:
-            # Non-quantized weight, store directly
             state_dict[short_key] = tensor
 
-    # Dequantize expert weights
-    log.info(f"Dequantizing {len(expert_parts)} expert projections...")
+    log.info(f"Dequantizing {len(expert_parts)} expert projections (INT4 GPTQ)...")
     for (expert_id, proj_name), parts in tqdm(
         sorted(expert_parts.items()), desc="Dequantizing experts"
     ):
@@ -131,19 +161,120 @@ def load_mtp_state_dict(mtp_weights_path, device="cpu"):
             parts["weight_scale"],
             parts["weight_shape"],
         )
-        out_key = f"mlp.experts.{expert_id}.{proj_name}.weight"
-        state_dict[out_key] = w
+        state_dict[f"mlp.experts.{expert_id}.{proj_name}.weight"] = w
 
     log.info(f"State dict has {len(state_dict)} entries")
     return state_dict
 
 
-def build_mtp_model(config_dir, state_dict, device):
-    """Build standalone MTP layer from DeepSeek config + dequantized weights.
+# ============================================================
+# Weight loading: V3 mode (extract MTP layer from model shards)
+# ============================================================
 
-    Imports the actual DeepSeek model classes and instantiates a single decoder layer.
-    """
-    # Add config dir to path for importing modeling_deepseek
+def load_mtp_state_dict_v3(model_dir, mtp_layer_idx=61, device="cpu"):
+    """Load and dequantize V3 MTP weights from model shard files."""
+    model_dir = Path(model_dir)
+    index_path = model_dir / "model.safetensors.index.json"
+
+    log.info(f"Loading V3 MTP weights from {model_dir} (layer {mtp_layer_idx})...")
+
+    with open(index_path) as f:
+        index = json.load(f)
+    weight_map = index["weight_map"]
+
+    # Find all keys for the MTP layer
+    prefix = f"model.layers.{mtp_layer_idx}."
+    mtp_keys = {k: v for k, v in weight_map.items() if k.startswith(prefix)}
+    # Also grab lm_head for comparison
+    if "lm_head.weight" in weight_map:
+        mtp_keys["lm_head.weight"] = weight_map["lm_head.weight"]
+
+    log.info(f"Found {len(mtp_keys)} MTP-related keys across shards")
+
+    # Group by shard file
+    shards = {}
+    for k, v in mtp_keys.items():
+        shards.setdefault(v, []).append(k)
+
+    state_dict = {}
+    expert_fp8_parts = {}  # (expert_id, proj_name) -> {weight, scale_inv}
+    expert_pattern = re.compile(
+        r"mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)"
+    )
+    # Non-expert FP8 patterns: collect weight + scale_inv pairs
+    fp8_non_expert = {}  # short_key_base -> {weight, scale_inv}
+
+    for shard_file, keys in sorted(shards.items()):
+        shard_path = model_dir / shard_file
+        log.info(f"Loading {shard_file} ({len(keys)} keys)...")
+        f = safe_open(str(shard_path), framework="pt", device=str(device))
+
+        for key in keys:
+            tensor = f.get_tensor(key)
+
+            if key == "lm_head.weight":
+                state_dict["_lm_head.weight"] = tensor
+                continue
+
+            short_key = key.removeprefix(prefix)
+
+            m = expert_pattern.match(short_key)
+            if m:
+                expert_id, proj_name, part = m.group(1), m.group(2), m.group(3)
+                ek = (int(expert_id), proj_name)
+                if ek not in expert_fp8_parts:
+                    expert_fp8_parts[ek] = {}
+                if part == "weight_scale_inv":
+                    expert_fp8_parts[ek]["scale_inv"] = tensor
+                else:
+                    expert_fp8_parts[ek]["weight"] = tensor
+            elif short_key.endswith(".weight_scale_inv"):
+                base_key = short_key.removesuffix(".weight_scale_inv")
+                fp8_non_expert.setdefault(base_key, {})["scale_inv"] = tensor
+            elif short_key.endswith(".weight"):
+                base_key = short_key.removesuffix(".weight")
+                # Check if this might be an FP8 weight (corresponding scale_inv exists)
+                scale_full_key = key + "_scale_inv"
+                if scale_full_key in weight_map:
+                    fp8_non_expert.setdefault(base_key, {})["weight"] = tensor
+                else:
+                    state_dict[short_key] = tensor
+            else:
+                state_dict[short_key] = tensor
+
+    # Dequantize non-expert FP8 weights
+    for base_key, parts in fp8_non_expert.items():
+        if "weight" in parts and "scale_inv" in parts:
+            w = dequant_fp8_block(parts["weight"], parts["scale_inv"])
+            state_dict[f"{base_key}.weight"] = w
+            log.info(f"  Dequantized FP8: {base_key}.weight {parts['weight'].shape}")
+        elif "weight" in parts:
+            state_dict[f"{base_key}.weight"] = parts["weight"]
+
+    # Dequantize expert FP8 weights
+    log.info(f"Dequantizing {len(expert_fp8_parts)} expert projections (FP8)...")
+    for (expert_id, proj_name), parts in tqdm(
+        sorted(expert_fp8_parts.items()), desc="Dequantizing experts"
+    ):
+        if "weight" in parts and "scale_inv" in parts:
+            w = dequant_fp8_block(parts["weight"], parts["scale_inv"])
+        elif "weight" in parts:
+            w = parts["weight"].bfloat16()
+        else:
+            log.warning(f"Missing weight for expert {expert_id}.{proj_name}")
+            continue
+        state_dict[f"mlp.experts.{expert_id}.{proj_name}.weight"] = w
+
+    log.info(f"State dict has {len(state_dict)} entries")
+    return state_dict
+
+
+# ============================================================
+# Model building
+# ============================================================
+
+def build_mtp_model(config_dir, state_dict, device):
+    """Build standalone MTP layer from DeepSeek config + dequantized weights."""
     config_dir = str(config_dir)
     if config_dir not in sys.path:
         sys.path.insert(0, config_dir)
@@ -151,15 +282,14 @@ def build_mtp_model(config_dir, state_dict, device):
     from configuration_deepseek import DeepseekV3Config
     from modeling_deepseek import DeepseekV3DecoderLayer, DeepseekV3RMSNorm
 
-    # Load text config
     with open(Path(config_dir) / "config.json") as f:
         full_config = json.load(f)
     text_config = full_config.get("text_config", full_config)
 
     config = DeepseekV3Config(**text_config)
     config._attn_implementation = "eager"
-    hidden_size = config.hidden_size  # 7168
-    vocab_size = config.vocab_size  # 163840
+    hidden_size = config.hidden_size
+    vocab_size = config.vocab_size
 
     log.info(f"Building MTP layer: hidden_size={hidden_size}, vocab_size={vocab_size}")
 
@@ -175,42 +305,26 @@ def build_mtp_model(config_dir, state_dict, device):
             self.shared_head = nn.Linear(hidden_size, vocab_size, bias=False)
 
         def forward(self, h_t, x_next_ids, debug=False):
-            """
-            Args:
-                h_t: Hidden states from base model [batch, seq_len, hidden_size]
-                x_next_ids: Next token IDs (input_ids shifted by 1) [batch, seq_len]
-            Returns:
-                logits: [batch, seq_len, vocab_size]
-            """
             batch_size, seq_len, _ = h_t.shape
 
-            # Embed next tokens and normalize
             x_embed = self.enorm(self.embed_tokens(x_next_ids))
             h_norm = self.hnorm(h_t)
-
-            # Concatenate and project
             hidden = self.eh_proj(torch.cat([x_embed, h_norm], dim=-1))
 
             if debug:
-                import logging as _log
-                _l = _log.getLogger(__name__)
-                _l.info("  h_t: mean=%.4f std=%.4f" % (h_t.float().mean().item(), h_t.float().std().item()))
-                _l.info("  x_embed: mean=%.4f std=%.4f" % (x_embed.float().mean().item(), x_embed.float().std().item()))
-                _l.info("  eh_proj out: mean=%.4f std=%.4f" % (hidden.float().mean().item(), hidden.float().std().item()))
+                log.info("  h_t: mean=%.4f std=%.4f" % (h_t.float().mean().item(), h_t.float().std().item()))
+                log.info("  x_embed: mean=%.4f std=%.4f" % (x_embed.float().mean().item(), x_embed.float().std().item()))
+                log.info("  eh_proj out: mean=%.4f std=%.4f" % (hidden.float().mean().item(), hidden.float().std().item()))
 
-            # Prepare position_ids for decoder layer
             position_ids = torch.arange(seq_len, device=h_t.device).unsqueeze(0).expand(batch_size, -1)
 
-            # Create 4D causal attention mask [batch, 1, seq, seq]
             causal_mask = torch.full(
-                (batch_size, 1, seq_len, seq_len), 
-                torch.finfo(hidden.dtype).min, 
+                (batch_size, 1, seq_len, seq_len),
+                torch.finfo(hidden.dtype).min,
                 device=hidden.device, dtype=hidden.dtype
             )
             causal_mask = torch.triu(causal_mask, diagonal=1)
-            # Expand to [batch, 1, seq, seq] - already correct shape
 
-            # Run through decoder layer (attention + MoE MLP)
             layer_out = self.decoder_layer(
                 hidden_states=hidden,
                 attention_mask=causal_mask,
@@ -219,15 +333,13 @@ def build_mtp_model(config_dir, state_dict, device):
             hidden = layer_out[0]
 
             if debug:
-                _l.info("  decoder out: mean=%.4f std=%.4f" % (hidden.float().mean().item(), hidden.float().std().item()))
+                log.info("  decoder out: mean=%.4f std=%.4f" % (hidden.float().mean().item(), hidden.float().std().item()))
 
-            # LM head
             logits = self.shared_head(self.shared_head_norm(hidden))
             return logits
 
     model = MTPLayer()
 
-    # Map state dict keys to model parameters
     key_mapping = {
         "embed_tokens.weight": "embed_tokens.weight",
         "enorm.weight": "enorm.weight",
@@ -240,21 +352,18 @@ def build_mtp_model(config_dir, state_dict, device):
     }
 
     new_state = {}
-
     for src_key, tensor in state_dict.items():
+        if src_key.startswith("_"):  # Skip internal keys like _lm_head.weight
+            continue
         if src_key in key_mapping:
-            dst_key = key_mapping[src_key]
-            new_state[dst_key] = tensor
+            new_state[key_mapping[src_key]] = tensor
         elif src_key.startswith("self_attn."):
-            dst_key = f"decoder_layer.{src_key}"
-            new_state[dst_key] = tensor
+            new_state[f"decoder_layer.{src_key}"] = tensor
         elif src_key.startswith("mlp."):
-            dst_key = f"decoder_layer.{src_key}"
-            new_state[dst_key] = tensor
+            new_state[f"decoder_layer.{src_key}"] = tensor
         else:
             log.warning(f"Unmapped key: {src_key}")
 
-    # Check for missing keys
     model_state = model.state_dict()
     missing = set(model_state.keys()) - set(new_state.keys())
     unexpected = set(new_state.keys()) - set(model_state.keys())
@@ -273,6 +382,10 @@ def build_mtp_model(config_dir, state_dict, device):
     return model
 
 
+# ============================================================
+# Evaluation
+# ============================================================
+
 @torch.no_grad()
 def evaluate_acceptance(model, data_dir, device, output_path):
     """Run teacher-forced MTP evaluation and compute acceptance rates."""
@@ -287,41 +400,30 @@ def evaluate_acceptance(model, data_dir, device, output_path):
 
     for pt_file in tqdm(pt_files, desc="Evaluating acceptance"):
         sample = torch.load(str(pt_file), map_location="cpu", weights_only=True)
-        input_ids = sample["input_ids"]          # [S]
-        hidden_states = sample["hidden_states"]  # [S, 7168]
-        loss_mask = sample["loss_mask"]           # [S]
+        input_ids = sample["input_ids"]
+        hidden_states = sample["hidden_states"]
+        loss_mask = sample["loss_mask"]
 
         seq_len = len(input_ids)
         if seq_len < 3:
             continue
 
-        # MTP at position t: takes h_t + embed(x_{t+1}) -> predicts x_{t+2}
-        # Valid range: t in [0, seq_len-3]
-        # h_t: hidden_states[0:seq_len-2]
-        # x_next: input_ids[1:seq_len-1]
-        # target: input_ids[2:seq_len]
-        # mask: loss_mask[2:seq_len] (only evaluate response positions)
+        h_t = hidden_states[:-2].unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+        x_next = input_ids[1:-1].unsqueeze(0).to(device=device)
+        targets = input_ids[2:].to(device=device)
+        mask = loss_mask[2:].to(device=device)
 
-        h_t = hidden_states[:-2].unsqueeze(0).to(device=device, dtype=torch.bfloat16)  # [1, S-2, D]
-        x_next = input_ids[1:-1].unsqueeze(0).to(device=device)  # [1, S-2]
-        targets = input_ids[2:].to(device=device)  # [S-2]
-        mask = loss_mask[2:].to(device=device)  # [S-2]
-
-        # Only process if there are response tokens
         if mask.sum() == 0:
             continue
 
-        # Forward pass (full sequence, no chunking - attention needs full context)
         is_debug = len(per_sample_results) < 1
-        logits = model(h_t, x_next, debug=is_debug).squeeze(0).float()  # [S-2, V]
+        logits = model(h_t, x_next, debug=is_debug).squeeze(0).float()
         torch.cuda.empty_cache()
 
-        # Top-1 accuracy
-        preds = logits.argmax(dim=-1)  # [S-2]
+        preds = logits.argmax(dim=-1)
         top1_match = (preds == targets) & (mask == 1)
         top1_correct = top1_match.sum().item()
 
-        # Debug: print stats for first 3 samples
         if len(per_sample_results) < 3:
             log.info(
                 "DEBUG sample %d: logits range=[%.2f, %.2f], std=%.4f, "
@@ -331,8 +433,7 @@ def evaluate_acceptance(model, data_dir, device, output_path):
                 preds[:5].tolist(), targets[:5].tolist()
             )
 
-        # Top-5 accuracy
-        top5_preds = logits.topk(5, dim=-1).indices  # [S-2, 5]
+        top5_preds = logits.topk(5, dim=-1).indices
         top5_match = (top5_preds == targets.unsqueeze(-1)).any(dim=-1) & (mask == 1)
         top5_correct = top5_match.sum().item()
 
@@ -341,7 +442,7 @@ def evaluate_acceptance(model, data_dir, device, output_path):
         total_top5_correct += top5_correct
         total_evaluated += n_evaluated
 
-        sample_result = {
+        per_sample_results.append({
             "file": pt_file.name,
             "seq_len": seq_len,
             "n_response_tokens": int(n_evaluated),
@@ -349,10 +450,8 @@ def evaluate_acceptance(model, data_dir, device, output_path):
             "top5_correct": int(top5_correct),
             "top1_rate": round(top1_correct / n_evaluated, 4) if n_evaluated > 0 else 0,
             "top5_rate": round(top5_correct / n_evaluated, 4) if n_evaluated > 0 else 0,
-        }
-        per_sample_results.append(sample_result)
+        })
 
-    # Overall results
     overall_top1 = total_top1_correct / total_evaluated if total_evaluated > 0 else 0
     overall_top5 = total_top5_correct / total_evaluated if total_evaluated > 0 else 0
 
@@ -383,24 +482,48 @@ def evaluate_acceptance(model, data_dir, device, output_path):
     return results
 
 
+# ============================================================
+# Main
+# ============================================================
+
 def main():
     args = parse_args()
 
-    # Default model-config to bundled k2_mtp_config
+    # Determine mode
+    if args.model_dir:
+        mode = "v3"
+        log.info("Mode: DeepSeek-V3 (FP8, model shards)")
+    elif args.mtp_weights:
+        mode = "k25"
+        log.info("Mode: Kimi-K2.5 (INT4 GPTQ, separate mtp.safetensors)")
+    else:
+        print("Error: must specify either --model-dir (V3) or --mtp-weights (K2.5)")
+        sys.exit(1)
+
+    # Default model-config
     if args.model_config is None:
-        args.model_config = str(Path(__file__).resolve().parent / "k2_mtp_config")
+        if mode == "v3":
+            args.model_config = args.model_dir
+        else:
+            args.model_config = str(Path(__file__).resolve().parent / "k2_mtp_config")
+
     log.info("=" * 60)
     log.info("Phase 2: MTP Acceptance Rate Evaluation")
     log.info("=" * 60)
 
-    # Step 1: Load and dequantize MTP weights
-    state_dict = load_mtp_state_dict(args.mtp_weights, device="cpu")
+    # Load weights
+    if mode == "v3":
+        state_dict = load_mtp_state_dict_v3(
+            args.model_dir, mtp_layer_idx=args.mtp_layer_idx, device="cpu"
+        )
+    else:
+        state_dict = load_mtp_state_dict_k25(args.mtp_weights, device="cpu")
 
-    # Step 2: Build MTP model
+    # Build model
     model = build_mtp_model(args.model_config, state_dict, args.device)
-    del state_dict  # Free memory
+    del state_dict
 
-    # Step 3: Evaluate
+    # Evaluate
     results = evaluate_acceptance(model, args.data_dir, args.device, args.output)
 
     log.info("Phase 2 complete!")
