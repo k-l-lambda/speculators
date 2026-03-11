@@ -107,6 +107,13 @@ if _HAS_DEEPSEEK:
                         attention_mask = _torch.triu(causal, diagonal=1)
                 except ImportError:
                     attention_mask = None
+            # Reset cache_position if passed: Eagle3 TTT uses arange(step*S, (step+1)*S)
+            # but K2.5 attention interprets large cache_position as kv_seq_len offset,
+            # causing attention mask size mismatch in deeper TTT steps.
+            if 'cache_position' in kwargs and kwargs['cache_position'] is not None:
+                kwargs['cache_position'] = _torch.arange(
+                    hidden_states.shape[1], device=hidden_states.device
+                )
             return super().forward(
                 hidden_states, attention_mask=attention_mask,
                 position_ids=position_ids, position_embeddings=position_embeddings,

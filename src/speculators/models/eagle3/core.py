@@ -73,7 +73,7 @@ def compute_accuracy(
         # Update prev_correct in place
         correct = torch.logical_and(prev_correct, correct, out=prev_correct)
     if loss_mask is not None:
-        correct = torch.masked_select(correct, loss_mask.to(torch.bool))
+        correct = correct[loss_mask.to(torch.bool)]
 
     correct_sum = correct.float().sum()
     full_denom = correct.numel()
