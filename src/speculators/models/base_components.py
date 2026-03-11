@@ -107,6 +107,10 @@ if _HAS_DEEPSEEK:
                         attention_mask = _torch.triu(causal, diagonal=1)
                 except ImportError:
                     attention_mask = None
+            # Eagle3 uses 1-indexed position_ids, but K2.5 rotary embedding
+            # returns cos[:seq_len] (0-indexed). Shift to avoid OOB at seq_len boundary.
+            if position_ids is not None and position_ids.min() >= 1:
+                position_ids = position_ids - 1
             # Reset cache_position if passed: Eagle3 TTT uses arange(step*S, (step+1)*S)
             # but K2.5 attention interprets large cache_position as kv_seq_len offset,
             # causing attention mask size mismatch in deeper TTT steps.

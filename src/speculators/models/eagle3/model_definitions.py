@@ -210,6 +210,11 @@ try:
                         hidden_states.shape[1], device=hidden_states.device
                     )
 
+                # Eagle3 uses 1-indexed position_ids, but K2.5 rotary embedding
+                # returns cos[:seq_len] (0-indexed). Shift to 0-indexed to avoid OOB.
+                if position_ids is not None and position_ids.min() >= 1:
+                    position_ids = position_ids - 1
+
                 # Eagle3 first-layer logic (reimplemented to handle K2.5 MLA 3-tuple return)
                 mid = hidden_states.shape[2] // 2
                 embeds, hidden = hidden_states.split(mid, dim=-1)
