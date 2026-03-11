@@ -56,6 +56,11 @@ def parse_args():
         help="Path to directory with config.json and modeling_deepseek.py "
              "(K2.5: defaults to scripts/k2_mtp_config/; V3: defaults to --model-dir)",
     )
+    # Speculators trained checkpoint mode
+    parser.add_argument(
+        "--speculators-checkpoint", type=str, default=None,
+        help="Path to speculators checkpoint directory (BF16 shards, no dequant)",
+    )
     # V3 mode
     parser.add_argument(
         "--model-dir", type=str, default=None,
@@ -456,6 +461,39 @@ def evaluate_acceptance(model, data_dir, device, output_path):
     return results
 
 
+
+# ============================================================
+# Load: Speculators checkpoint (BF16, no dequantization)
+# ============================================================
+
+def load_mtp_state_dict_speculators(checkpoint_dir, device="cpu"):
+    import json
+    from safetensors import safe_open
+    from pathlib import Path
+    ckpt = Path(checkpoint_dir)
+    with open(ckpt / "model.safetensors.index.json") as f:
+        index = json.load(f)
+    raw = {}
+    for shard in sorted(set(index["weight_map"].values())):
+        log.info("  Loading shard %s...", shard)
+        with safe_open(str(ckpt / shard), framework="pt", device=device) as f:
+            for k in f.keys():
+                raw[k] = f.get_tensor(k)
+    # Remap: speculators keys -> MTPLayer keys
+    remapped = {}
+    for k, v in raw.items():
+        if k == "shared_head.weight":
+            remapped["shared_head.head.weight"] = v
+        elif k == "shared_head_norm.weight":
+            remapped["shared_head.norm.weight"] = v
+        elif k.startswith("layers.0."):
+            remapped["decoder_layer." + k[len("layers.0."):]] = v
+        else:
+            remapped[k] = v
+    log.info("Loaded %d tensors from speculators checkpoint", len(remapped))
+    return remapped
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -463,12 +501,14 @@ def evaluate_acceptance(model, data_dir, device, output_path):
 def main():
     args = parse_args()
 
-    if args.model_dir:
+    if args.speculators_checkpoint:
+        mode = "speculators"
+    elif args.model_dir:
         mode = "v3"
     elif args.mtp_weights:
         mode = "k25"
     else:
-        sys.exit("Error: specify --model-dir (V3 mode) or --mtp-weights (K2.5 mode)")
+        sys.exit("Error: specify --speculators-checkpoint, --model-dir, or --mtp-weights")
 
     # Default model-config directory
     if args.model_config is None:
@@ -481,7 +521,9 @@ def main():
     log.info(f"Phase 2: MTP Acceptance Rate Evaluation [{mode.upper()} mode]")
     log.info("=" * 60)
 
-    if mode == "v3":
+    if mode == "speculators":
+        state_dict = load_mtp_state_dict_speculators(args.speculators_checkpoint, device="cpu")
+    elif mode == "v3":
         state_dict = load_mtp_state_dict_v3(
             args.model_dir, mtp_layer_idx=args.mtp_layer_idx, device="cpu"
         )
