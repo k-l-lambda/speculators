@@ -68,6 +68,10 @@ def parse_args():
         help="Number of ShareGPT conversations to use",
     )
     parser.add_argument(
+        "--skip", type=int, default=0,
+        help="Skip first N samples after shuffle (for independent test sets)",
+    )
+    parser.add_argument(
         "--seq-length", type=int, default=2048,
         help="Max sequence length",
     )
@@ -200,6 +204,8 @@ def main():
     random.seed(args.seed)
     indices = list(range(len(raw_dataset)))
     random.shuffle(indices)
+    if args.skip > 0:
+        indices = indices[args.skip:]
     if len(indices) > args.max_samples:
         indices = indices[:args.max_samples]
     raw_dataset = raw_dataset.select(indices)

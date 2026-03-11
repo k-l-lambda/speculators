@@ -25,6 +25,98 @@ from speculators.models.mtp.config import MTPSpeculatorConfig
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.utils.loading import load_model_layers
 
+from loguru import logger as log
+
+
+def _load_k25_layer_weights(verifier_path: str, layer_idx: int) -> dict:
+    """Load K2.5/DeepSeek layer weights, dequantizing INT4 compressed-tensors experts."""
+    import json
+    from pathlib import Path
+    from safetensors import safe_open
+
+    vpath = Path(verifier_path)
+    with open(vpath / "model.safetensors.index.json") as f:
+        index = json.load(f)
+    wm = index["weight_map"]
+
+    # Find all keys belonging to this layer (handles VLM prefix)
+    # K2.5 uses prefix "language_model.model.layers.{idx}."
+    prefixes = [
+        f"model.layers.{layer_idx}.",
+        f"language_model.model.layers.{layer_idx}.",
+    ]
+    layer_keys = {}
+    for k, shard in wm.items():
+        for pfx in prefixes:
+            if k.startswith(pfx):
+                layer_keys[k] = (shard, pfx)
+                break
+
+    if not layer_keys:
+        raise ValueError(f"No keys found for layer {layer_idx} in {verifier_path}")
+
+    # Group by shard
+    shard_keys: dict = {}
+    for full_key, (shard, pfx) in layer_keys.items():
+        shard_keys.setdefault(shard, []).append((full_key, pfx))
+
+    raw = {}
+    for shard, key_pfx_list in shard_keys.items():
+        shard_path = vpath / shard
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            for full_key, _ in key_pfx_list:
+                raw[full_key] = f.get_tensor(full_key)
+
+    # Build state dict: strip prefix, dequantize INT4 experts
+    sd = {}
+    # Group keys by base name (excluding _packed/_scale/_shape suffixes)
+    int4_groups: dict = {}
+    for full_key, (_, pfx) in layer_keys.items():
+        short = full_key.removeprefix(pfx)
+        if short.endswith(".weight_packed"):
+            base = short[:-len(".weight_packed")]
+            int4_groups.setdefault(base, {})["packed"] = raw[full_key]
+        elif short.endswith(".weight_scale"):
+            base = short[:-len(".weight_scale")]
+            int4_groups.setdefault(base, {})["scale"] = raw[full_key]
+        elif short.endswith(".weight_shape"):
+            base = short[:-len(".weight_shape")]
+            int4_groups.setdefault(base, {})["shape"] = raw[full_key]
+        else:
+            sd[short] = raw[full_key].to(torch.bfloat16)
+
+    # Dequantize INT4 groups
+    for base, parts in int4_groups.items():
+        if "packed" in parts and "scale" in parts and "shape" in parts:
+            wp = parts["packed"]   # [out, in/8] int32
+            ws = parts["scale"]    # [out, in/group_size] bf16
+            wsh = parts["shape"]   # [out, in] int32
+            out_f = wsh[0].item()
+            in_f = wsh[1].item()
+            group_size = in_f // ws.shape[1]
+            pack_factor = in_f // wp.shape[1]
+            # Unpack INT4 values from INT32
+            w = torch.zeros(out_f, in_f, dtype=torch.float32)
+            for i in range(pack_factor):
+                nibble = (wp >> (i * 4)) & 0xF
+                nibble = nibble.float() - 8.0  # symmetric: [-8, 7]
+                w[:, i::pack_factor] = nibble
+            # Apply per-group scale
+            w = w.reshape(out_f, in_f // group_size, group_size)
+            w = w * ws.float().unsqueeze(-1)
+            w = w.reshape(out_f, in_f).to(torch.bfloat16)
+            sd[f"{base}.weight"] = w
+        else:
+            # Partial group (shouldn't happen) — skip
+            log.warning(f"Incomplete INT4 group for {base}, skipping")
+
+    log.info(
+        f"Loaded layer {layer_idx}: {len(sd)} tensors "
+        f"({len(int4_groups)} dequantized, {len(sd)-len(int4_groups)} direct)"
+    )
+    return sd
+
+
 
 def mtp_loss_ce(
     logits: torch.Tensor,       # [1, S, vocab_size]
@@ -343,20 +435,18 @@ class MTPDraftModel(SpeculatorModel):
         decoder_layer = DeepseekV3DecoderLayer(ds_config, layer_idx=layer_idx)
         self.layers.append(decoder_layer)
 
-        # Load verifier weights for this layer
-        layer_prefix = f"model.layers.{layer_idx}."
+        # Load verifier weights for this layer (handles INT4 compressed-tensors)
         try:
-            weights = load_model_layers([f"{layer_prefix}*"], verifier_path)
-            sd = {}
-            for k, v in weights.items():
-                short_key = k.removeprefix(layer_prefix)
-                sd[short_key] = v.to(torch.bfloat16)
+            sd = _load_k25_layer_weights(verifier_path, layer_idx)
             missing, unexpected = decoder_layer.load_state_dict(sd, strict=False)
+            loaded = len(sd) - len(missing)
+            log.info(
+                f"Loaded {loaded}/{len(sd)} keys for layer {layer_idx} "
+                f"(missing {len(missing)}, unexpected {len(unexpected)})"
+            )
             if missing:
-                warnings.warn(
-                    f"Missing keys loading layer {layer_idx}: "
-                    f"{missing[:5]}...",
-                    UserWarning, stacklevel=2,
+                log.warning(
+                    f"Missing keys: {missing[:3]}..."
                 )
         except Exception as e:
             warnings.warn(
