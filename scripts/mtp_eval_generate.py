@@ -92,8 +92,8 @@ def parse_args():
         help="HuggingFace cache directory",
     )
     parser.add_argument(
-        "--layer-id", type=int, default=60,
-        help="Layer index to capture hidden states from (default: 60, last layer)",
+        "--layer-ids", type=int, nargs="+", default=None,
+        help="Layer indices for hidden state extraction. Default: [-1] (last layer). For Eagle3: use e.g. --layer-ids 2 30 58 60",
     )
     return parser.parse_args()
 
@@ -232,7 +232,7 @@ def main():
     log.info("Initializing VllmHiddenStatesGenerator...")
     generator = VllmHiddenStatesGenerator(
         model_path=args.model_path,
-        layer_ids=[args.layer_id],
+        layer_ids=args.layer_ids if args.layer_ids else [-1],
         max_model_len=args.seq_length,
         tensor_parallel_size=args.tensor_parallel_size,
     )
@@ -262,7 +262,8 @@ def main():
 
                 data_dict = {
                     "input_ids": result["input_ids"],
-                    "hidden_states": result["hidden_states"][0],  # Single layer [S, D]
+                    # Multi-layer: save as list; single-layer: save as tensor
+                    "hidden_states": result["hidden_states"][0] if len(result["hidden_states"]) == 1 else result["hidden_states"],
                     "loss_mask": loss_mask,
                 }
                 output_path = output_dir / f"data_{file_idx}.pt"
@@ -277,7 +278,7 @@ def main():
     # Save metadata
     meta = {
         "model_path": args.model_path,
-        "layer_id": args.layer_id,
+        "layer_ids": args.layer_ids if args.layer_ids else [-1],
         "seq_length": args.seq_length,
         "num_samples": file_idx,
         "seed": args.seed,
