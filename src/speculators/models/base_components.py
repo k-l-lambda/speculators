@@ -13,6 +13,37 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
+# DeepSeek-V3 / Kimi-K2.5: import from bundled k2_mtp_config
+# These use MLA attention (not standard q/k/v) and MoE
+import os as _os
+from pathlib import Path as _Path
+
+_k2_config_dir = _Path(__file__).parent.parent.parent.parent / "scripts" / "k2_mtp_config"
+if _k2_config_dir.exists():
+    import importlib.util as _ilu
+    _spec_cfg = _ilu.spec_from_file_location(
+        "configuration_deepseek", _k2_config_dir / "configuration_deepseek.py"
+    )
+    _mod_cfg = _ilu.module_from_spec(_spec_cfg)
+    _spec_cfg.loader.exec_module(_mod_cfg)
+
+    # Patch sys.modules so modeling_deepseek can find configuration_deepseek
+    import sys as _sys
+    _sys.modules["configuration_deepseek"] = _mod_cfg
+
+    _spec_mod = _ilu.spec_from_file_location(
+        "modeling_deepseek", _k2_config_dir / "modeling_deepseek.py"
+    )
+    _mod_mod = _ilu.module_from_spec(_spec_mod)
+    _spec_mod.loader.exec_module(_mod_mod)
+
+    DeepseekV3DecoderLayer = _mod_mod.DeepseekV3DecoderLayer
+    DeepseekV3RMSNorm = _mod_mod.DeepseekV3RMSNorm
+    DeepseekV3Config = _mod_cfg.DeepseekV3Config
+    _HAS_DEEPSEEK = True
+else:
+    _HAS_DEEPSEEK = False
+
 
 class ModelComponents(NamedTuple):
     """Container for the components of a speculators model.
@@ -50,6 +81,15 @@ model_classes: dict[str, ModelComponents] = {
         Qwen3RotaryEmbedding,
     ),
 }
+
+# Conditionally register kimi_k2 if DeepSeek modeling is available
+if _HAS_DEEPSEEK:
+    model_classes["kimi_k2"] = ModelComponents(
+        DeepseekV3DecoderLayer,  # will be overridden by Eagle3 first layer
+        DeepseekV3DecoderLayer,
+        DeepseekV3RMSNorm,
+        lambda config: None,  # MLA handles rotary internally
+    )
 
 
 def override_components(model_type: str, **overrides) -> ModelComponents:

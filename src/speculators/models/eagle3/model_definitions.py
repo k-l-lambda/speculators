@@ -133,6 +133,63 @@ class Qwen3DecoderEagle3FirstLayer(Eagle3FirstLayerMixin, Qwen3DecoderLayer):
         self._patch_eagle3_projections(config, Qwen3RMSNorm, norm_before_residual)
 
 
+# DeepSeek-V3 / Kimi-K2.5 Eagle3 first layer (MLA attention adaptation)
+try:
+    from speculators.models.base_components import (
+        DeepseekV3DecoderLayer as _DsDecoderLayer,
+        DeepseekV3RMSNorm as _DsRMSNorm,
+        DeepseekV3Config as _DsConfig,
+        _HAS_DEEPSEEK,
+    )
+
+    if _HAS_DEEPSEEK:
+        class DeepseekV3DecoderEagle3FirstLayer(Eagle3FirstLayerMixin, _DsDecoderLayer):
+            """Eagle3 first layer for K2.5/DeepSeek-V3 with MLA attention.
+
+            MLA uses LoRA-style projections instead of standard q/k/v:
+            - q_a_proj [H -> q_lora_rank] + q_b_proj [q_lora_rank -> heads*dim]
+            - kv_a_proj_with_mqa [H -> kv_lora_rank+rope_dim] + kv_b_proj [...]
+
+            We patch q_a_proj and kv_a_proj_with_mqa to accept 2*H input,
+            leaving the b_proj (which generates actual Q/K/V) unchanged.
+            """
+            def __init__(
+                self,
+                config: _DsConfig,
+                layer_idx: int,
+                norm_before_residual: bool = False,
+            ):
+                # Set eager attention to avoid flash attention issues during training
+                config._attn_implementation = "eager"
+                super().__init__(config, layer_idx)
+                self._patch_eagle3_projections_mla(config, _DsRMSNorm, norm_before_residual)
+
+            def _patch_eagle3_projections_mla(self, config, norm_class, norm_before_residual):
+                """Patch MLA input projections to accept 2*hidden_size."""
+                self.norm_before_residual = norm_before_residual
+                self.hidden_norm = norm_class(
+                    config.hidden_size, eps=getattr(config, 'rms_norm_eps', 1e-5)
+                )
+                # MLA: patch LoRA input projections (a_proj) to accept 2*H
+                self.self_attn.q_a_proj = torch.nn.Linear(
+                    2 * config.hidden_size,
+                    config.q_lora_rank,
+                    bias=config.attention_bias,
+                )
+                self.self_attn.kv_a_proj_with_mqa = torch.nn.Linear(
+                    2 * config.hidden_size,
+                    config.kv_lora_rank + config.qk_rope_head_dim,
+                    bias=config.attention_bias,
+                )
+                # q_b_proj, kv_b_proj, kv_a_layernorm, q_a_layernorm: unchanged
+
+            # forward() is inherited from Eagle3FirstLayerMixin — it splits
+            # hidden_states into embeds/hidden, applies norms, and concatenates
+            # before passing to self_attn. The MLA attention handles the rest.
+except ImportError:
+    _HAS_DEEPSEEK = False
+
+
 model_classes: dict[str, base_components.ModelComponents] = {
     "llama": base_components.override_components(
         "llama", first_layer_class=LlamaDecoderEagle3FirstLayer
@@ -141,3 +198,9 @@ model_classes: dict[str, base_components.ModelComponents] = {
         "qwen3", first_layer_class=Qwen3DecoderEagle3FirstLayer
     ),
 }
+
+# Register kimi_k2 Eagle3 first layer if available
+if _HAS_DEEPSEEK:
+    model_classes["kimi_k2"] = base_components.override_components(
+        "kimi_k2", first_layer_class=DeepseekV3DecoderEagle3FirstLayer
+    )
