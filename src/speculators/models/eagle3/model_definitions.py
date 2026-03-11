@@ -203,6 +203,13 @@ try:
                     except ImportError:
                         attention_mask = None
 
+                # Reset cache_position: Eagle3 TTT uses arange(step*S, (step+1)*S)
+                # but K2.5 MLA interprets large values as kv_seq_len offset
+                if cache_position is not None:
+                    cache_position = torch.arange(
+                        hidden_states.shape[1], device=hidden_states.device
+                    )
+
                 # Eagle3 first-layer logic (reimplemented to handle K2.5 MLA 3-tuple return)
                 mid = hidden_states.shape[2] // 2
                 embeds, hidden = hidden_states.split(mid, dim=-1)
