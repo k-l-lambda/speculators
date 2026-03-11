@@ -9,6 +9,12 @@ from transformers import LlamaConfig, PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
+# Import DeepseekV3Config for kimi_k2 architecture
+try:
+    from speculators.models.base_components import DeepseekV3Config, _HAS_DEEPSEEK
+except ImportError:
+    _HAS_DEEPSEEK = False
+
 from speculators.model import SpeculatorModel
 from speculators.train.data import (
     Eagle3SampleFileDataset,
@@ -28,6 +34,8 @@ DRAFT_ARCH_CONFIGS: dict[str, type] = {
     "llama": LlamaConfig,
     "qwen3": Qwen3Config,
 }
+if _HAS_DEEPSEEK:
+    DRAFT_ARCH_CONFIGS["kimi_k2"] = DeepseekV3Config
 
 
 def set_seed(seed: int, deterministic: bool = False):
