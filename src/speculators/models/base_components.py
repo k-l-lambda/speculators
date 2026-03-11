@@ -36,6 +36,7 @@ if _k2_config_dir.exists():
     )
     _mod_mod = _ilu.module_from_spec(_spec_mod)
     _spec_mod.loader.exec_module(_mod_mod)
+    _sys.modules["modeling_deepseek"] = _mod_mod
 
     DeepseekV3DecoderLayer = _mod_mod.DeepseekV3DecoderLayer
     DeepseekV3RMSNorm = _mod_mod.DeepseekV3RMSNorm
@@ -84,12 +85,42 @@ model_classes: dict[str, ModelComponents] = {
 
 # Conditionally register kimi_k2 if DeepSeek modeling is available
 if _HAS_DEEPSEEK:
-    model_classes["kimi_k2"] = ModelComponents(
-        DeepseekV3DecoderLayer,  # will be overridden by Eagle3 first layer
-        DeepseekV3DecoderLayer,
+    import torch as _torch
+
+    class _DeepseekRotaryProxy:
+        def __init__(self, config): pass
+        def __call__(self, hidden_states, position_ids): return (None, None)
+
+    class _BlockMaskCompatDecoder(DeepseekV3DecoderLayer):
+        def forward(self, hidden_states, attention_mask=None, position_ids=None,
+                    position_embeddings=None, **kwargs):
+            if attention_mask is not None and not isinstance(attention_mask, _torch.Tensor):
+                try:
+                    from torch.nn.attention.flex_attention import BlockMask
+                    if isinstance(attention_mask, BlockMask):
+                        seq_len = hidden_states.shape[1]
+                        causal = _torch.full(
+                            (1, 1, seq_len, seq_len),
+                            _torch.finfo(hidden_states.dtype).min,
+                            dtype=hidden_states.dtype, device=hidden_states.device,
+                        )
+                        attention_mask = _torch.triu(causal, diagonal=1)
+                except ImportError:
+                    attention_mask = None
+            return super().forward(
+                hidden_states, attention_mask=attention_mask,
+                position_ids=position_ids, position_embeddings=position_embeddings,
+                **kwargs
+            )
+
+    _deepseek_components = ModelComponents(
+        _BlockMaskCompatDecoder,
+        _BlockMaskCompatDecoder,
         DeepseekV3RMSNorm,
-        lambda config: None,  # MLA handles rotary internally
+        _DeepseekRotaryProxy,
     )
+    model_classes["kimi_k2"] = _deepseek_components
+    model_classes["deepseek_v3"] = _deepseek_components
 
 
 def override_components(model_type: str, **overrides) -> ModelComponents:

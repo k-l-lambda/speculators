@@ -122,7 +122,7 @@ def create_transformer_layer_config(
         )
 
     config_class = DRAFT_ARCH_CONFIGS[draft_arch]
-    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
+    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path, trust_remote_code=True)
 
     # For multimodal models (Qwen3VL, etc.), extract text_config
     if hasattr(verifier_config, "text_config"):
@@ -174,7 +174,7 @@ def main(args: argparse.Namespace):
         d2t = None
         t2d = None
         # When vocab mapping is not provided, use the full verifier vocab
-        verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path)
+        verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path, trust_remote_code=True)
         if hasattr(verifier_config, "text_config"):
             verifier_config = verifier_config.text_config
         draft_vocab_size = verifier_config.vocab_size

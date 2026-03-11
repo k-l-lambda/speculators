@@ -137,13 +137,14 @@ class Qwen3DecoderEagle3FirstLayer(Eagle3FirstLayerMixin, Qwen3DecoderLayer):
 try:
     from speculators.models.base_components import (
         DeepseekV3DecoderLayer as _DsDecoderLayer,
+        _BlockMaskCompatDecoder as _DsBlockMaskDecoder,
         DeepseekV3RMSNorm as _DsRMSNorm,
         DeepseekV3Config as _DsConfig,
         _HAS_DEEPSEEK,
     )
 
     if _HAS_DEEPSEEK:
-        class DeepseekV3DecoderEagle3FirstLayer(Eagle3FirstLayerMixin, _DsDecoderLayer):
+        class DeepseekV3DecoderEagle3FirstLayer(Eagle3FirstLayerMixin, _DsBlockMaskDecoder):
             """Eagle3 first layer for K2.5/DeepSeek-V3 with MLA attention.
 
             MLA uses LoRA-style projections instead of standard q/k/v:
@@ -183,9 +184,54 @@ try:
                 )
                 # q_b_proj, kv_b_proj, kv_a_layernorm, q_a_layernorm: unchanged
 
-            # forward() is inherited from Eagle3FirstLayerMixin — it splits
-            # hidden_states into embeds/hidden, applies norms, and concatenates
-            # before passing to self_attn. The MLA attention handles the rest.
+            def forward(self, hidden_states, attention_mask=None, position_ids=None,
+                        past_key_values=None, use_cache=False, cache_position=None,
+                        position_embeddings=None, **kwargs):
+                # Convert Eagle3 BlockMask to standard 4D causal tensor for K2.5 MLA
+                if attention_mask is not None and not isinstance(attention_mask, torch.Tensor):
+                    try:
+                        from torch.nn.attention.flex_attention import BlockMask
+                        if isinstance(attention_mask, BlockMask):
+                            seq_len = hidden_states.shape[1]
+                            dtype = hidden_states.dtype
+                            device = hidden_states.device
+                            causal = torch.full(
+                                (1, 1, seq_len, seq_len),
+                                torch.finfo(dtype).min, dtype=dtype, device=device,
+                            )
+                            attention_mask = torch.triu(causal, diagonal=1)
+                    except ImportError:
+                        attention_mask = None
+
+                # Eagle3 first-layer logic (reimplemented to handle K2.5 MLA 3-tuple return)
+                mid = hidden_states.shape[2] // 2
+                embeds, hidden = hidden_states.split(mid, dim=-1)
+                residual = hidden
+                embeds = self.input_layernorm(embeds)
+                hidden = self.hidden_norm(hidden)
+                if self.norm_before_residual:
+                    residual = hidden
+                hidden_states = torch.cat([embeds, hidden], dim=-1)
+
+                # K2.5 attention returns (output, weights, past_kv) — 3 values
+                attn_result = self.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+                attn_output = attn_result[0] if isinstance(attn_result, tuple) else attn_result
+                hidden_states = residual + attn_output
+
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+                return hidden_states
 except ImportError:
     _HAS_DEEPSEEK = False
 
@@ -201,6 +247,8 @@ model_classes: dict[str, base_components.ModelComponents] = {
 
 # Register kimi_k2 Eagle3 first layer if available
 if _HAS_DEEPSEEK:
-    model_classes["kimi_k2"] = base_components.override_components(
+    _kimi_eagle3 = base_components.override_components(
         "kimi_k2", first_layer_class=DeepseekV3DecoderEagle3FirstLayer
     )
+    model_classes["kimi_k2"] = _kimi_eagle3
+    model_classes["deepseek_v3"] = _kimi_eagle3  # same config type from DeepseekV3Config
