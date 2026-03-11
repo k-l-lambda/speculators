@@ -119,16 +119,19 @@ def _load_k25_layer_weights(verifier_path: str, layer_idx: int) -> dict:
 
 
 def mtp_loss_ce(
-    logits: torch.Tensor,       # [1, S, vocab_size]
-    target_ids: torch.Tensor,   # [1, S]
-    loss_mask: torch.Tensor | None,  # [1, S]
+    logits: torch.Tensor,       # [B, S, vocab_size]
+    target_ids: torch.Tensor,   # [B, S]
+    loss_mask: torch.Tensor | None,  # [B, S]
 ) -> torch.Tensor:
     """Cross-entropy loss for MTP: predict target_ids from logits."""
-    logits_flat = logits.squeeze(0)   # [S, V]
-    targets_flat = target_ids.squeeze(0)  # [S]
-    ce = nn.functional.cross_entropy(logits_flat, targets_flat, reduction="none")
+    # Use transpose to support batch_size >= 1: [B, V, S] for cross_entropy
+    ce = nn.functional.cross_entropy(
+        logits.transpose(1, 2),   # [B, V, S]
+        target_ids,                # [B, S]
+        reduction="none",
+    )  # [B, S]
     if loss_mask is not None:
-        mask = loss_mask.squeeze(0).float()
+        mask = loss_mask.float()
         return (ce * mask).sum() / (mask.sum() + 1e-5)
     return ce.mean()
 
@@ -289,7 +292,10 @@ class MTPDraftModel(SpeculatorModel):
 
         # Step 4: Decoder layer
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+            # Expand to [B, T] to avoid potential decoder issues with batch>1
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(
+                hidden_states.shape[0], -1
+            )
 
         # Build 4D causal attention mask required by DeepSeekV3 attention
         # Shape: [1, 1, seq_len, seq_len], lower-triangular (causal)
@@ -321,9 +327,10 @@ class MTPDraftModel(SpeculatorModel):
             return logits
 
         # Target: input_ids shifted by 1 (predict t+2)
+        batch_size = input_ids.shape[0]
         target_ids = torch.cat([
             input_ids[:, 1:],
-            input_ids.new_zeros(1, 1),
+            input_ids.new_zeros(batch_size, 1),
         ], dim=-1)
 
         # Mask out last position (no target)
@@ -331,7 +338,7 @@ class MTPDraftModel(SpeculatorModel):
             adjusted_mask = loss_mask.clone()
             adjusted_mask[:, -1] = 0
         else:
-            adjusted_mask = torch.ones(1, seq_len, device=device)
+            adjusted_mask = torch.ones(batch_size, seq_len, device=device)
             adjusted_mask[:, -1] = 0
 
         metrics = {}
@@ -343,7 +350,7 @@ class MTPDraftModel(SpeculatorModel):
                 )
                 verifier_targets = torch.cat([
                     verifier_logits[:, 1:, :],
-                    verifier_logits.new_zeros(1, 1, verifier_logits.shape[-1]),
+                    verifier_logits.new_zeros(batch_size, 1, verifier_logits.shape[-1]),
                 ], dim=1)
             loss = mtp_loss_kl(logits, verifier_targets, adjusted_mask)
         else:
@@ -406,6 +413,11 @@ class MTPDraftModel(SpeculatorModel):
         num_layers = verifier_config.num_hidden_layers
         if layer_idx < 0:
             layer_idx = num_layers + layer_idx
+        if not (0 <= layer_idx < num_layers):
+            raise ValueError(
+                f"layer_idx {layer_idx} out of range [0, {num_layers}) for verifier "
+                f"with {num_layers} layers."
+            )
 
         # Import DeepSeek modeling code
         config_dir = (
@@ -449,9 +461,15 @@ class MTPDraftModel(SpeculatorModel):
                     f"Missing keys: {missing[:3]}..."
                 )
         except Exception as e:
+            if freeze:
+                raise RuntimeError(
+                    f"Could not load verifier layer {layer_idx} for frozen decoder: {e}. "
+                    "Frozen decoder with random init would produce invalid training. "
+                    "Check that verifier_path is correct and contains the expected layer."
+                ) from e
             warnings.warn(
                 f"Could not load verifier layer {layer_idx}: {e}. "
-                "Using random init.",
+                "Using random init (decoder is trainable, this may be intentional).",
                 UserWarning, stacklevel=2,
             )
 

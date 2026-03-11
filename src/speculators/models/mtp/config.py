@@ -27,7 +27,7 @@ class MTPSpeculatorConfig(SpeculatorModelConfig):
 
     speculators_model_type: Literal["mtp"] = "mtp"
     architectures: list[str] = Field(
-        default_factory=lambda: ["MTPSpeculator"],
+        default_factory=lambda: ["MTPDraftModel"],
         description="Model architectures that can load these weights",
     )
 
@@ -48,11 +48,13 @@ class MTPSpeculatorConfig(SpeculatorModelConfig):
 
     @field_serializer("decoder_layer_config")
     def serialize_decoder_config(self, value: PretrainedConfig) -> dict:
-        return value.to_diff_dict()
+        return value.to_dict()
 
     @field_validator("decoder_layer_config", mode="before")
     @classmethod
     def validate_decoder_config(cls, value: Any) -> PretrainedConfig:
+        if isinstance(value, PretrainedConfig):
+            return value
         if isinstance(value, dict):
             config_class: type[PretrainedConfig] = LlamaConfig
             if "model_type" in value:
@@ -60,4 +62,6 @@ class MTPSpeculatorConfig(SpeculatorModelConfig):
                     model_type=value["model_type"]
                 ).__class__
             return config_class(**value)
-        return value
+        raise TypeError(
+            f"decoder_layer_config must be a PretrainedConfig or dict, got {type(value)}"
+        )
