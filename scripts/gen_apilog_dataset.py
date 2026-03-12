@@ -345,23 +345,62 @@ def main():
     # Phase 1: Load CSV
     all_rows = load_rows_from_csv(args.csv_path)
 
-    # Phase 2: Shuffle & split
-    rng = random.Random(args.seed)
-    rng.shuffle(all_rows)
-    sampled = all_rows[:args.train_size + args.val_size]
-    train_rows = sampled[:args.train_size]
-    val_rows   = sampled[args.train_size:]
-    log.info(f"Sampled: {len(train_rows)} train + {len(val_rows)} val rows")
-
-    # Phase 3: Load tokenizer
+    # Phase 2: Load tokenizer (needed for pre-filtering)
     log.info("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Phase 2b: Pre-filter by estimated input token length
+    log.info(f"Pre-filtering by input length <= {args.seq_length} tokens...")
+    filtered = []
+    too_long = 0
+    for row in all_rows:
+        msgs = row.get('messages', [])
+        if msgs:
+            # Extract text safely (content may be list for multimodal)
+            parts = []
+            for m in msgs:
+                c = m.get('content', '') or ''
+                if isinstance(c, list):
+                    parts.extend(str(x.get('text', x) if isinstance(x, dict) else x) for x in c)
+                else:
+                    parts.append(str(c))
+            char_count = sum(len(p) for p in parts)
+            # Conservative pre-filter: 3.5 chars/token, allow 20% margin
+            if char_count / 3.5 > args.seq_length * 1.2:
+                too_long += 1
+                continue
+        filtered.append(row)
+    log.info(f"  Pre-filtered: {len(filtered)} kept, {too_long} too long (>{args.seq_length} tokens est.)")
+
+    # Phase 2c: Split into has-response / no-response pools, shuffle each
+    rng = random.Random(args.seed)
+    has_resp = [r for r in filtered if r.get('response')]
+    no_resp = [r for r in filtered if not r.get('response')]
+    rng.shuffle(has_resp)
+    rng.shuffle(no_resp)
+    log.info(f"  Has response: {len(has_resp)}, No response: {len(no_resp)}")
+
+    # Phase 2d: Sample train+val, prioritizing has-response
+    total_needed = args.train_size + args.val_size
+    sampled = has_resp[:total_needed]
+    if len(sampled) < total_needed:
+        remaining = total_needed - len(sampled)
+        n_no_resp = min(remaining, len(no_resp))
+        sampled.extend(no_resp[:n_no_resp])
+        log.info(f"  Sampled {len(has_resp[:total_needed])} with response + {n_no_resp} without")
+    else:
+        log.info(f"  All {total_needed} samples have response (no generation needed)")
+
+    rng.shuffle(sampled)  # mix for train/val split
+    train_rows = sampled[:args.train_size]
+    val_rows   = sampled[args.train_size:args.train_size + args.val_size]
+    log.info(f"Sampled: {len(train_rows)} train + {len(val_rows)} val rows")
+
     for name, rows in [("train", train_rows), ("val", val_rows)]:
-        missing = sum(1 for r in rows if not r['response'])
-        log.info(f"{name}: {missing}/{len(rows)} items need generation")
+        missing = sum(1 for r in rows if not r.get('response'))
+        log.info(f"  {name}: {missing}/{len(rows)} items need generation")
 
     # Phase 4: Generate missing responses (train then val)
     train_rows = generate_missing_responses(
