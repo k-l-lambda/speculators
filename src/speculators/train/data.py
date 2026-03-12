@@ -286,7 +286,7 @@ def standardize_data_mtp(data: dict) -> dict:
     # }
     h = data['hidden_states']
     if isinstance(h, list):
-        h = h[0]
+        h = h[-1]  # use last layer (e.g. layer 60 for K2.5)
     return {
         'hidden_states': h,
         'input_ids': data['input_ids'],

@@ -385,6 +385,7 @@ def evaluate_acceptance(model, data_dir, device, output_path):
         input_ids     = sample["input_ids"]
         hidden_states = sample["hidden_states"]
         # Handle 4-layer Eagle3 format: extract last layer for MTP
+        # (standardize_data_mtp uses h[-1] = last/deepest layer, e.g. layer 60 for K2.5)
         if isinstance(hidden_states, list):
             hidden_states = hidden_states[-1]
         loss_mask     = sample["loss_mask"]
