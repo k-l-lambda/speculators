@@ -411,22 +411,14 @@ def evaluate_acceptance(model, data_dir, device, output_path):
         if s_mask.sum() == 0:
             continue
 
-        # Run model in training mode to get metrics with shift-aligned data
-        _, _, mtp_metrics = model(
-            h_t, x_ids,
-            loss_mask=s_mask.unsqueeze(0),
-            verifier_last_hidden_states=shifted["verifier_last_hidden_states"].unsqueeze(0).to(device=device, dtype=torch.bfloat16),
-            loss_type="ce",
-        )
-
-        # Also compute targets for per-token stats
+        # Compute targets with shift-aligned data (same as training)
         targets = torch.cat([shifted["input_ids"][1:], torch.zeros(1, dtype=shifted["input_ids"].dtype)]).to(device=device)
         adjusted_mask = s_mask.clone()
         adjusted_mask[-1] = 0
         mask = adjusted_mask.to(device=device)
 
         is_debug = len(per_sample) < 1
-        logits = model(h_t, x_ids).squeeze(0).float()
+        logits = model(h_t, x_ids, debug=is_debug).squeeze(0).float()
         torch.cuda.empty_cache()
 
         preds = logits.argmax(dim=-1)
