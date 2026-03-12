@@ -12,7 +12,7 @@ os.environ["TRUST_REMOTE_CODE"] = "1"
 
 from speculators.models.eagle3.core import Eagle3DraftModel
 from speculators.models.eagle3 import Eagle3SpeculatorConfig
-from speculators.train.data import standardize_data_v1
+from speculators.train.data import standardize_data_v1, shift_batch
 
 
 def load_eagle3_from_checkpoint(checkpoint_dir: str, d2t=None, t2d=None,
@@ -57,6 +57,7 @@ def main():
     p.add_argument("--t2d-path", default=None)
     p.add_argument("--ttt-steps", type=int, default=3)
     p.add_argument("--device", default="cuda:0")
+    p.add_argument("--apply-shift", action="store_true", help="Apply shift_batch (same as training collate_fn)")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -94,8 +95,13 @@ def main():
             except Exception as e:
                 continue
 
+            if args.apply_shift:
+                data["position_ids"] = torch.arange(len(data["input_ids"]))
+                data["lengths"] = torch.tensor([len(data["input_ids"])])
+                data = shift_batch(data)
+
             seq_len = len(data["input_ids"])
-            if seq_len < 3 or data["loss_mask"].sum() == 0:
+            if seq_len < 2 or data["loss_mask"].sum() == 0:
                 continue
 
             batch = {}
@@ -106,9 +112,10 @@ def main():
                         dtype=torch.bfloat16 if v.is_floating_point() else v.dtype
                     )
 
-            batch["lengths"] = torch.tensor([seq_len], device=device)
-            # Pass 0-indexed position_ids to avoid OOB in rotary (core.py uses 1+arange)
-            batch["position_ids"] = torch.arange(seq_len, device=device).unsqueeze(0)
+            if "lengths" not in batch:
+                batch["lengths"] = torch.tensor([seq_len], device=device)
+            if "position_ids" not in batch:
+                batch["position_ids"] = torch.arange(seq_len, device=device).unsqueeze(0)
 
             try:
                 _tokens, _loss, metrics = model(**batch, ttt_steps=args.ttt_steps)

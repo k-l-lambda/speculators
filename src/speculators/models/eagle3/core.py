@@ -43,6 +43,7 @@ def build_packed_attention_mask(
         [1, 1, total_seq_len, total_seq_len] additive attention mask:
         0 for allowed positions, -inf for masked positions.
     """
+    lengths = lengths.flatten()  # handle 2D batch tensor
     doc_ids = torch.repeat_interleave(
         torch.arange(lengths.numel(), device=device, dtype=torch.long),
         lengths.to(device),
