@@ -540,7 +540,9 @@ class Eagle3DraftModel(SpeculatorModel):
                 )
                 # shape: [1, total_seq_len]
 
-            attention_mask = extend_mask_for_draft_tokens(attention_mask)
+            # For dense 4D masks (K2.5), skip BlockMask extension (no KV cache across TTT steps)
+            if not isinstance(attention_mask, torch.Tensor):
+                attention_mask = extend_mask_for_draft_tokens(attention_mask)
             position_ids = position_ids + 1
             # shape: [1, total_seq_len]
 
