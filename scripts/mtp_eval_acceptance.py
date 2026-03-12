@@ -61,6 +61,10 @@ def parse_args():
         "--speculators-checkpoint", type=str, default=None,
         help="Path to speculators checkpoint directory (BF16 shards, no dequant)",
     )
+    parser.add_argument(
+        "--verifier-name-or-path", type=str, default=None,
+        help="Path to verifier model (K2.5) for loading frozen decoder weights in speculators mode",
+    )
     # V3 mode
     parser.add_argument(
         "--model-dir", type=str, default=None,
@@ -541,7 +545,41 @@ def main():
     log.info("=" * 60)
 
     if mode == "speculators":
-        state_dict = load_mtp_state_dict_speculators(args.speculators_checkpoint, device="cpu")
+        # Use MTPDraftModel which properly loads K2.5 frozen decoder weights
+        from speculators.models.mtp import MTPDraftModel
+        from transformers import AutoConfig
+        from safetensors.torch import load_file as load_safetensors
+        from pathlib import Path as _P
+
+        verifier_path = args.verifier_name_or_path
+        if verifier_path is None:
+            verifier_path = "/data/.cache_claude/huggingface/hub/models--moonshotai--Kimi-K2.5/snapshots/54383e83fa343a1331754112fb9e3410c55efa2f"
+            log.info("Using default verifier: %s", verifier_path)
+
+        verifier_config = AutoConfig.from_pretrained(verifier_path, trust_remote_code=True)
+        if hasattr(verifier_config, "text_config"):
+            verifier_config = verifier_config.text_config
+
+        model = MTPDraftModel.from_training_args(
+            verifier_config=verifier_config,
+            verifier_name_or_path=verifier_path,
+            freeze_decoder=True,
+            verifier_layer_idx=-1,
+        )
+        # Load speculators checkpoint (trainable weights only)
+        ckpt_path = _P(args.speculators_checkpoint)
+        sd = {}
+        for f in sorted(ckpt_path.glob("model-*.safetensors")):
+            sd.update(load_safetensors(str(f), device="cpu"))
+        if not sd:
+            sd = load_safetensors(str(ckpt_path / "model.safetensors"), device="cpu")
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        log.info("Loaded checkpoint: %d keys, %d missing (frozen decoder)", len(sd), len(missing))
+
+        model = model.to(device=args.device, dtype=torch.bfloat16).eval()
+        param_count = sum(p.numel() for p in model.parameters())
+        log.info("MTP model loaded: %.2fB parameters", param_count / 1e9)
+        state_dict = None
     elif mode == "v3":
         state_dict = load_mtp_state_dict_v3(
             args.model_dir, mtp_layer_idx=args.mtp_layer_idx, device="cpu"
@@ -549,8 +587,9 @@ def main():
     else:
         state_dict = load_mtp_state_dict_k25(args.mtp_weights, device="cpu")
 
-    model = build_mtp_model(args.model_config, state_dict, args.device)
-    del state_dict
+    if state_dict is not None:
+        model = build_mtp_model(args.model_config, state_dict, args.device)
+        del state_dict
 
     results = evaluate_acceptance(model, args.data_dir, args.device, args.output)
     log.info("Phase 2 complete!")
