@@ -384,6 +384,9 @@ def evaluate_acceptance(model, data_dir, device, output_path):
         sample = torch.load(str(pt_file), map_location="cpu", weights_only=True)
         input_ids     = sample["input_ids"]
         hidden_states = sample["hidden_states"]
+        # Handle 4-layer Eagle3 format: extract last layer for MTP
+        if isinstance(hidden_states, list):
+            hidden_states = hidden_states[-1]
         loss_mask     = sample["loss_mask"]
 
         seq_len = len(input_ids)

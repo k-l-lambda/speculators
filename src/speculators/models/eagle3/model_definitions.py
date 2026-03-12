@@ -187,21 +187,12 @@ try:
             def forward(self, hidden_states, attention_mask=None, position_ids=None,
                         past_key_values=None, use_cache=False, cache_position=None,
                         position_embeddings=None, **kwargs):
-                # Convert Eagle3 BlockMask to standard 4D causal tensor for K2.5 MLA
+                # Reject BlockMask — K2.5 requires dense 4D mask with document boundaries.
                 if attention_mask is not None and not isinstance(attention_mask, torch.Tensor):
-                    try:
-                        from torch.nn.attention.flex_attention import BlockMask
-                        if isinstance(attention_mask, BlockMask):
-                            seq_len = hidden_states.shape[1]
-                            dtype = hidden_states.dtype
-                            device = hidden_states.device
-                            causal = torch.full(
-                                (1, 1, seq_len, seq_len),
-                                torch.finfo(dtype).min, dtype=dtype, device=device,
-                            )
-                            attention_mask = torch.triu(causal, diagonal=1)
-                    except ImportError:
-                        attention_mask = None
+                    raise TypeError(
+                        f"Eagle3 K2.5 first layer received non-tensor attention_mask "
+                        f"(type={type(attention_mask).__name__}). Use build_packed_attention_mask()."
+                    )
 
                 # Reset cache_position: Eagle3 TTT uses arange(step*S, (step+1)*S)
                 # but K2.5 MLA interprets large values as kv_seq_len offset

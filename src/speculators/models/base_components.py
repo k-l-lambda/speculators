@@ -94,19 +94,15 @@ if _HAS_DEEPSEEK:
     class _BlockMaskCompatDecoder(DeepseekV3DecoderLayer):
         def forward(self, hidden_states, attention_mask=None, position_ids=None,
                     position_embeddings=None, **kwargs):
+            # Reject BlockMask — K2.5 requires dense 4D mask with document boundaries.
+            # The mask should be built upstream from lengths via build_packed_attention_mask().
             if attention_mask is not None and not isinstance(attention_mask, _torch.Tensor):
-                try:
-                    from torch.nn.attention.flex_attention import BlockMask
-                    if isinstance(attention_mask, BlockMask):
-                        seq_len = hidden_states.shape[1]
-                        causal = _torch.full(
-                            (1, 1, seq_len, seq_len),
-                            _torch.finfo(hidden_states.dtype).min,
-                            dtype=hidden_states.dtype, device=hidden_states.device,
-                        )
-                        attention_mask = _torch.triu(causal, diagonal=1)
-                except ImportError:
-                    attention_mask = None
+                raise TypeError(
+                    f"_BlockMaskCompatDecoder received non-tensor attention_mask "
+                    f"(type={type(attention_mask).__name__}). K2.5 requires a dense 4D "
+                    f"attention mask preserving packed document boundaries. "
+                    f"Use build_packed_attention_mask() in core.py instead."
+                )
             # Eagle3 uses 1-indexed position_ids, but K2.5 rotary embedding
             # returns cos[:seq_len] (0-indexed). Shift to avoid OOB at seq_len boundary.
             if position_ids is not None and position_ids.min() >= 1:

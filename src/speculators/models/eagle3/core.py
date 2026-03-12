@@ -18,6 +18,59 @@ from speculators.models.eagle3.model_definitions import model_classes
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.utils.loading import load_model_layers
 
+# Models that need dense 4D attention masks (no flex_attention support)
+_DENSE_MASK_MODEL_TYPES = {"deepseek_v3", "kimi_k2"}
+
+
+def build_packed_attention_mask(
+    lengths: "torch.Tensor",
+    total_seq_len: int,
+    dtype: "torch.dtype",
+    device: "torch.device",
+) -> "torch.Tensor":
+    """Build a 4D per-document causal attention mask from packed sequence lengths.
+
+    For multipack batches where multiple sequences are concatenated, this creates
+    a block-diagonal causal mask that prevents cross-sequence attention.
+
+    Args:
+        lengths: [num_docs] tensor of sequence lengths in the packed batch.
+        total_seq_len: Total length of the packed sequence (sum of lengths, possibly padded).
+        dtype: Dtype for the mask (should match hidden_states dtype).
+        device: Device for the mask.
+
+    Returns:
+        [1, 1, total_seq_len, total_seq_len] additive attention mask:
+        0 for allowed positions, -inf for masked positions.
+    """
+    doc_ids = torch.repeat_interleave(
+        torch.arange(lengths.numel(), device=device, dtype=torch.long),
+        lengths.to(device),
+    )
+    if doc_ids.numel() < total_seq_len:
+        doc_ids = torch.cat([
+            doc_ids,
+            torch.full(
+                (total_seq_len - doc_ids.numel(),),
+                -1, device=device, dtype=torch.long,
+            ),
+        ])
+
+    q_idx = torch.arange(total_seq_len, device=device)[:, None]
+    kv_idx = torch.arange(total_seq_len, device=device)[None, :]
+    allowed = (
+        (doc_ids[:, None] != -1)
+        & (doc_ids[:, None] == doc_ids[None, :])
+        & (q_idx >= kv_idx)
+    )
+
+    mask = torch.zeros(
+        (total_seq_len, total_seq_len), dtype=dtype, device=device
+    )
+    mask = mask.masked_fill(~allowed, torch.finfo(dtype).min)
+    return mask[None, None, :, :]
+
+
 
 def align_for_step(
     logits: torch.Tensor,  # shape: [1, total_seq_len, draft_vocab_size]
@@ -377,16 +430,23 @@ class Eagle3DraftModel(SpeculatorModel):
 
         past_key_values = DynamicCache(config=self.config.transformer_layer_config)
 
-        combined_mask_mod = create_combined_mask_mod(lengths.to(device), total_seq_len)
-        # Note: Attention mask is stored as a BlockMask object
-        attention_mask = create_block_mask(
-            combined_mask_mod,
-            B=None,
-            H=None,
-            Q_LEN=total_seq_len,
-            KV_LEN=total_seq_len,
-            device=device,
-        )
+        # Build attention mask: dense 4D for models without flex_attention (K2.5),
+        # BlockMask for models that support it (Llama, Qwen3)
+        model_type = self.config.transformer_layer_config.model_type
+        if model_type in _DENSE_MASK_MODEL_TYPES:
+            attention_mask = build_packed_attention_mask(
+                lengths, total_seq_len, hidden_states.dtype, device
+            )
+        else:
+            combined_mask_mod = create_combined_mask_mod(lengths.to(device), total_seq_len)
+            attention_mask = create_block_mask(
+                combined_mask_mod,
+                B=None,
+                H=None,
+                Q_LEN=total_seq_len,
+                KV_LEN=total_seq_len,
+                device=device,
+            )
 
         hidden_states = self.fc(hidden_states)
         # shape: [1, total_seq_len, hidden_size]

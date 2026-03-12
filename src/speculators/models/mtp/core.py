@@ -297,16 +297,20 @@ class MTPDraftModel(SpeculatorModel):
                 hidden_states.shape[0], -1
             )
 
-        # Build 4D causal attention mask required by DeepSeekV3 attention
-        # Shape: [1, 1, seq_len, seq_len], lower-triangular (causal)
+        # Build 4D attention mask with per-document boundaries for multipack batches
         dtype = fused.dtype
-        causal_mask = torch.full(
-            (1, 1, seq_len, seq_len),
-            fill_value=torch.finfo(dtype).min,
-            dtype=dtype, device=device,
-        )
-        causal_mask = torch.triu(causal_mask, diagonal=1)
-        # Lower-triangular = 0 (attend), upper-triangular = -inf (block)
+        if lengths is not None and lengths.numel() > 1:
+            # Multipack: build per-document causal mask from lengths
+            from speculators.models.eagle3.core import build_packed_attention_mask
+            causal_mask = build_packed_attention_mask(lengths, seq_len, dtype, device)
+        else:
+            # Single sequence: simple causal mask
+            causal_mask = torch.full(
+                (1, 1, seq_len, seq_len),
+                fill_value=torch.finfo(dtype).min,
+                dtype=dtype, device=device,
+            )
+            causal_mask = torch.triu(causal_mask, diagonal=1)
 
         for layer in self.layers:
             layer_output = layer(
