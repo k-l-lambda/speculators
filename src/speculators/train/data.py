@@ -271,6 +271,18 @@ def create_collate_fn(max_len: int):
             new_lengths.append(length)
             cum_length += length
         collated_data["lengths"] = torch.tensor(new_lengths, dtype=torch.long)
+
+        # Regenerate position_ids from lengths after truncation
+        # (original per-sample position_ids may exceed max_len after shift_batch)
+        import torch as _torch
+        pos = []
+        for length in new_lengths:
+            pos.append(_torch.arange(length, dtype=_torch.long))
+        pos_cat = _torch.cat(pos)
+        if pos_cat.numel() < max_len:
+            pos_cat = _torch.cat([pos_cat, _torch.zeros(max_len - pos_cat.numel(), dtype=_torch.long)])
+        collated_data["position_ids"] = pos_cat[:max_len].unsqueeze(0)
+
         return collated_data
 
     return collate_fn
