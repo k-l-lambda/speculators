@@ -281,7 +281,9 @@ def create_collate_fn(max_len: int):
         pos_cat = _torch.cat(pos)
         if pos_cat.numel() < max_len:
             pos_cat = _torch.cat([pos_cat, _torch.zeros(max_len - pos_cat.numel(), dtype=_torch.long)])
-        collated_data["position_ids"] = pos_cat[:max_len].unsqueeze(0)
+        final_pos = pos_cat[:max_len].unsqueeze(0)
+        assert final_pos.max() < max_len, f"COLLATE BUG: pos max={final_pos.max()} >= max_len={max_len}, lengths={new_lengths}"
+        collated_data["position_ids"] = final_pos
 
         return collated_data
 
