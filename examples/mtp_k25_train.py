@@ -45,7 +45,7 @@ from speculators.train.trainer import Trainer, TrainerConfig
 from speculators.train.utils import maybe_destroy_distributed, maybe_setup_distributed
 
 
-VERIFIER_NAME_OR_PATH = "/data/.cache_claude/huggingface/hub/models--moonshotai--Kimi-K2.5/snapshots/54383e83fa343a1331754112fb9e3410c55efa2f"
+VERIFIER_NAME_OR_PATH = "/home/claude/.cache/huggingface/hub/models--moonshotai--Kimi-K2.5/snapshots/54383e83fa343a1331754112fb9e3410c55efa2f"
 
 
 def parse_args():
