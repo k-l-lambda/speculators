@@ -67,6 +67,11 @@ def _patched_forward(
 
     hidden_states, _ = self.norm(hidden_states, residual)
     if should_capture and aux_hidden_states:
+        # Replace the last captured layer with post-norm version if it was the final layer
+        # vLLM runtime passes post-norm hidden_states to MTP, so training data must match
+        last_layer_idx = self.end_layer - 1
+        if last_layer_idx in target_layers:
+            aux_hidden_states[-1] = hidden_states.clone()
         extension._store_captured_states(aux_hidden_states)  # noqa: SLF001
 
     return hidden_states
