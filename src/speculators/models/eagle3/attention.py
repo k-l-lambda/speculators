@@ -155,6 +155,15 @@ def flex_attention_forward(
     key = key.contiguous()
     value = value.contiguous()
 
+    # Fallback to SDPA when attention_mask is a dense tensor (not BlockMask)
+    if isinstance(attention_mask, torch.Tensor):
+        attention_output = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, scale=scaling,
+            enable_gqa=enable_gqa,
+        )
+        attention_output = attention_output.transpose(1, 2).contiguous()
+        return attention_output, None
+
     flex_attention_output = flex_attention(
         query,
         key,

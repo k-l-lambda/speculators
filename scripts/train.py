@@ -21,6 +21,7 @@ from speculators.train.data import (
     create_collate_fn,
     split_files,
     standardize_data_v1,
+    standardize_data_mtp,
 )
 from speculators.train.distributed_batch_sampler import (
     MultipackDistributedBatchSamplerV2,
@@ -79,7 +80,7 @@ def setup_dataloader(
     else:
         noise_transform = None
 
-    standardize_fn = standardize_data_v1
+    standardize_fn = standardize_data_mtp if args.speculator_type == "mtp" else standardize_data_v1
 
     dataset = Eagle3SampleFileDataset(
         file_list=file_list,
@@ -330,6 +331,7 @@ def parse_args():
     parser.add_argument("--scheduler-warmup-steps", type=int, default=None)
     parser.add_argument("--scheduler-total-steps", type=int, default=None)
     parser.add_argument("--scheduler-num-cosine-cycles", type=float, default=0.5)
+    parser.add_argument("--loss-type", type=str, default="ce", choices=["ce", "kl"])
     return parser.parse_args()
 
 
