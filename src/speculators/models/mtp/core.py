@@ -324,7 +324,7 @@ class MTPDraftModel(SpeculatorModel):
                 fused = layer_output
 
         # Step 5: Predict
-        logits = self.shared_head(self.shared_head_norm(fused))
+        logits = self.shared_head(self.shared_head_norm(fused).to(self.shared_head.weight.dtype))
 
         return_loss = verifier_last_hidden_states is not None
         if not return_loss:
@@ -350,7 +350,7 @@ class MTPDraftModel(SpeculatorModel):
         if loss_type == "kl":
             with torch.no_grad():
                 verifier_logits = self.verifier_lm_head(
-                    self.verifier_norm(verifier_last_hidden_states)
+                    self.verifier_norm(verifier_last_hidden_states).to(self.verifier_lm_head.weight.dtype)
                 )
                 verifier_targets = torch.cat([
                     verifier_logits[:, 1:, :],
@@ -446,6 +446,11 @@ class MTPDraftModel(SpeculatorModel):
             )
 
         ds_config = DeepseekV3Config(**verifier_config.to_dict())
+        # Restore rope_scaling that transformers 5.x strips in to_dict()
+        if ds_config.rope_scaling is None and hasattr(verifier_config, "rope_scaling") and verifier_config.rope_scaling is not None:
+            ds_config.rope_scaling = verifier_config.rope_scaling
+        # Force rope_scaling with all keys needed by modeling_deepseek.py
+        ds_config.rope_scaling = {"type": "yarn", "rope_type": "yarn", "factor": 64.0, "original_max_position_embeddings": 4096, "beta_fast": 32.0, "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0, "rope_theta": 50000.0}
         ds_config._attn_implementation = "eager"
 
         decoder_layer = DeepseekV3DecoderLayer(ds_config, layer_idx=layer_idx)

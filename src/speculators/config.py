@@ -236,7 +236,7 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         description="The type of model from the Speculators repo this config is for.",
     )
     speculators_version: str = Field(
-        default=version("speculators"),
+        default="0.5.0",
         description="Version of the speculators library",
     )
     speculators_config: SpeculatorsConfig = Field(  # type: ignore[assignment]

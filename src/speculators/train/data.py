@@ -307,3 +307,4 @@ def standardize_data_mtp(data: dict) -> dict:
         'verifier_last_hidden_states': h,
         'loss_mask': data['loss_mask'],
     }
+
