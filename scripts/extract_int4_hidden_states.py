@@ -60,6 +60,7 @@ def main():
         batch_files = pt_files[batch_start:batch_start + args.batch_size]
 
         batch_data = []
+# Skip files already processed        batch_files_filtered = []        for pt_file in batch_files:            out_path = output_dir / pt_file.name            if out_path.exists():                processed += 1                continue            batch_files_filtered.append(pt_file)        batch_files = batch_files_filtered
         for pt_file in batch_files:
             sample = torch.load(str(pt_file), map_location="cpu", weights_only=True)
             input_ids = sample["input_ids"]
@@ -83,12 +84,17 @@ def main():
             print(f"Batch {batch_start} failed: {e}", flush=True)
             continue
 
-        for data, result in zip(batch_data, results):
+        # Generator sorts results by str(idx), not insertion order
+        sorted_idx = sorted(range(len(batch_data)), key=lambda i: str(i))
+        reordered = [None] * len(batch_data)
+        for k, orig in enumerate(sorted_idx):
+            reordered[orig] = results[k]
+        for data, result in zip(batch_data, reordered):
             out_path = output_dir / data["file"].name
             torch.save({
                 "input_ids": result["input_ids"],
                 "hidden_states": result["hidden_states"],
-                "loss_mask": result.get("loss_mask", data["loss_mask"]),
+                "loss_mask": data["loss_mask"],
             }, str(out_path))
             processed += 1
 

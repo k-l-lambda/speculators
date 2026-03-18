@@ -82,6 +82,10 @@ def parse_args():
         "--device", type=str, default="cuda:0",
         help="Device to run on (default: cuda:0)",
     )
+    parser.add_argument(
+        "--zero-position0-embed", action="store_true",
+        help="Zero position-0 token embeddings (simulate vLLM behavior)",
+    )
     return parser.parse_args()
 
 
@@ -300,6 +304,8 @@ def build_mtp_model(config_dir, state_dict, device):
             batch_size, seq_len, _ = h_t.shape
 
             x_embed = self.enorm(self.embed_tokens(x_next_ids))
+            if getattr(self, "zero_pos0", False):
+                x_embed[:, 0, :] = 0.0
             h_norm = self.hnorm(h_t)
             hidden = self.eh_proj(torch.cat([x_embed, h_norm], dim=-1))
 
@@ -393,6 +399,9 @@ def evaluate_acceptance(model, data_dir, device, output_path):
         if isinstance(hidden_states, list):
             hidden_states = hidden_states[-1]
         loss_mask     = sample["loss_mask"]
+        # Align loss_mask length to input_ids (INT4 hidden states may be truncated)
+        if loss_mask is not None and len(loss_mask) != len(input_ids):
+            loss_mask = loss_mask[:len(input_ids)]
 
         seq_len = len(input_ids)
         if seq_len < 3:
@@ -590,6 +599,9 @@ def main():
     if state_dict is not None:
         model = build_mtp_model(args.model_config, state_dict, args.device)
         del state_dict
+        if args.zero_position0_embed:
+            model.zero_pos0 = True
+            log.info("Enabled position-0 embedding zeroing")
 
     results = evaluate_acceptance(model, args.data_dir, args.device, args.output)
     log.info("Phase 2 complete!")
