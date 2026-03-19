@@ -283,6 +283,9 @@ class MTPDraftModel(SpeculatorModel):
         with torch.no_grad():
             token_embed = self.embed_tokens(input_ids)
         embed_normed = self.enorm(token_embed)
+        # Zero position-0 embedding to match vLLM MTP serving behavior
+        if position_ids is not None:
+            embed_normed = torch.where(position_ids.unsqueeze(-1) == 0, torch.zeros_like(embed_normed), embed_normed)
 
         # Step 2: Normalize verifier hidden states
         hidden_normed = self.hnorm(hidden_states)
