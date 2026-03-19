@@ -180,7 +180,13 @@ def step_extract(args):
         vw.update({k: w[k] for k in w if k in needed})
     hs = vw["language_model.model.norm.weight"].shape[0]
     vs = vw["language_model.lm_head.weight"].shape[0]
-    v_norm = nn.modules.normalization.RMSNorm(hs, eps=1e-6).cuda().to(torch.bfloat16)
+    # Get RMSNorm eps from model config (not hardcoded)
+    from transformers import AutoConfig
+    _cfg = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    _text_cfg = getattr(_cfg, 'text_config', _cfg)
+    _eps = getattr(_text_cfg, 'rms_norm_eps', 1e-6)
+    v_norm = nn.modules.normalization.RMSNorm(hs, eps=_eps).cuda().to(torch.bfloat16)
+    print(f"  RMSNorm eps={_eps}")
     v_norm.load_state_dict({"weight": vw["language_model.model.norm.weight"].to(torch.bfloat16)})
     v_lm_w = vw["language_model.lm_head.weight"].to(torch.bfloat16).cuda()
     TOP_K = 100

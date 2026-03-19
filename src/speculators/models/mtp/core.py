@@ -352,14 +352,24 @@ class MTPDraftModel(SpeculatorModel):
             top_vals = kwargs.get("top_logits_values")
             top_ids = kwargs.get("top_logits_indices")
             if top_vals is not None and top_ids is not None:
-                # Reconstruct sparse verifier logits from top-K
-                # top_vals: [B, seq, K], top_ids: [B, seq, K]
-                vocab_size = self.shared_head.weight.shape[0]
-                verifier_targets = torch.full(
-                    (batch_size, seq_len, vocab_size),
-                    float("-inf"), device=device, dtype=logits.dtype,
-                )
-                verifier_targets.scatter_(2, top_ids.to(device).long(), top_vals.to(device).to(logits.dtype))
+                assert top_ids is not None, "top_logits_values and top_logits_indices must both be present"
+                # Gathered KL: avoid materializing dense [B, S, V] target tensor
+                # target_p = softmax(top_vals) is renormalized over top-K support
+                # KL = sum_i p_i * (log p_i - log q_i) where q_i = student probs at top-K positions
+                top_vals_dev = top_vals.to(device).to(logits.dtype)
+                top_ids_dev = top_ids.to(device).long()
+                target_p = torch.nn.functional.softmax(top_vals_dev, dim=-1)
+                student_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                gathered_log_q = torch.gather(student_log_probs, 2, top_ids_dev)
+                elementwise_kl = target_p * (torch.log(target_p.clamp_min(1e-10)) - gathered_log_q)
+                # Sum over top-K dimension, apply loss_mask
+                kl_per_token = elementwise_kl.sum(dim=-1)  # [B, S]
+                if adjusted_mask is not None:
+                    kl_per_token = kl_per_token * adjusted_mask
+                    denom = adjusted_mask.sum(dim=1) + 1e-5
+                else:
+                    denom = seq_len
+                loss = (kl_per_token.sum(dim=1) / denom).mean()
             else:
                 with torch.no_grad():
                     verifier_logits = self.verifier_lm_head(
@@ -369,7 +379,7 @@ class MTPDraftModel(SpeculatorModel):
                         verifier_logits[:, 1:, :],
                         verifier_logits.new_zeros(batch_size, 1, verifier_logits.shape[-1]),
                     ], dim=1)
-            loss = mtp_loss_kl(logits, verifier_targets, adjusted_mask)
+                loss = mtp_loss_kl(logits, verifier_targets, adjusted_mask)
         else:
             loss = mtp_loss_ce(logits, target_ids, adjusted_mask)
 

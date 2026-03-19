@@ -312,8 +312,12 @@ def standardize_data_mtp(data: dict) -> dict:
         'verifier_last_hidden_states': h,
         'loss_mask': data['loss_mask'],
     }
-    # Pass through top-K verifier logits if present
-    if 'top_logits_values' in data:
+    # Pass through top-K verifier logits if present (both must exist)
+    has_vals = 'top_logits_values' in data
+    has_ids = 'top_logits_indices' in data
+    if has_vals != has_ids:
+        raise ValueError("top_logits_values and top_logits_indices must both be present or both absent")
+    if has_vals:
         result['top_logits_values'] = data['top_logits_values']
         result['top_logits_indices'] = data['top_logits_indices']
     return result
