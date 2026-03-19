@@ -82,18 +82,6 @@ def parse_args():
         "--device", type=str, default="cuda:0",
         help="Device to run on (default: cuda:0)",
     )
-    parser.add_argument(
-        "--zero-position0-embed", action="store_true",
-    parser.add_argument(
-        "--vllm-align", action="store_true",
-        help="Use vLLM MTP alignment: (h[t], x[t+2]) instead of shift_batch (h[t], x[t+1])",
-    )
-        help="Zero position-0 token embeddings (simulate vLLM behavior)",
-    parser.add_argument(
-        "--vllm-align", action="store_true",
-        help="Use vLLM MTP alignment: (h[t], x[t+2]) instead of shift_batch (h[t], x[t+1])",
-    )
-    )
     return parser.parse_args()
 
 
@@ -420,7 +408,7 @@ def evaluate_acceptance(model, data_dir, device, output_path):
 
         # Apply token-hidden alignment
         from speculators.train.data import shift_batch
-        if getattr(args, "vllm_align", False):
+        if False:  # vllm_align removed
             # vLLM alignment: (h[t], x[t+2]) — hidden_state 2 steps behind token
             shifted_input_ids = input_ids[2:]
             shifted_hidden = hidden_states[:-2]
@@ -432,7 +420,7 @@ def evaluate_acceptance(model, data_dir, device, output_path):
             }
         else:
             shifted = shift_batch(
-            "input_ids": input_ids,
+            {"input_ids": input_ids,
             "hidden_states": hidden_states,
             "verifier_last_hidden_states": hidden_states,
             "loss_mask": loss_mask,
@@ -621,9 +609,6 @@ def main():
     if state_dict is not None:
         model = build_mtp_model(args.model_config, state_dict, args.device)
         del state_dict
-        if args.zero_position0_embed:
-            model.zero_pos0 = True
-            log.info("Enabled position-0 embedding zeroing")
 
     results = evaluate_acceptance(model, args.data_dir, args.device, args.output)
     log.info("Phase 2 complete!")
