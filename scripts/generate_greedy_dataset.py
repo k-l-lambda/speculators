@@ -167,6 +167,25 @@ def step_extract(args):
     )
     print("Generator ready")
 
+    # Load verifier weights for top-K logits
+    import safetensors.torch
+    import torch.nn as nn
+    model_index_path = Path(args.model_path) / "model.safetensors.index.json"
+    vw = {}
+    with open(str(model_index_path)) as f2:
+        idx = json.load(f2)
+    needed = {"language_model.lm_head.weight", "language_model.model.norm.weight"}
+    for shard in set(v for k,v in idx["weight_map"].items() if k in needed):
+        w = safetensors.torch.load_file(str(Path(args.model_path) / shard))
+        vw.update({k: w[k] for k in w if k in needed})
+    hs = vw["language_model.model.norm.weight"].shape[0]
+    vs = vw["language_model.lm_head.weight"].shape[0]
+    v_norm = nn.modules.normalization.RMSNorm(hs, eps=1e-6).cuda().to(torch.bfloat16)
+    v_norm.load_state_dict({"weight": vw["language_model.model.norm.weight"].to(torch.bfloat16)})
+    v_lm_w = vw["language_model.lm_head.weight"].to(torch.bfloat16).cuda()
+    TOP_K = 100
+    print(f"Verifier logits: hidden={hs}, vocab={vs}, top_k={TOP_K}")
+
     # Process in batches
     processed = 0
     for batch_start in tqdm(range(0, len(sequences), args.batch_size), desc="Extracting"):
@@ -188,10 +207,17 @@ def step_extract(args):
         for seq, result in zip(batch, reordered):
             out_name = seq["file"].replace(".pt", ".pt")
             out_path = output_dir / out_name
+            last_hs = result["hidden_states"][-1]
+            with torch.no_grad():
+                normed = v_norm(last_hs.unsqueeze(0).cuda().to(torch.bfloat16))
+                lgt = torch.nn.functional.linear(normed[0], v_lm_w)
+                tk_v, tk_i = torch.topk(lgt, TOP_K, dim=-1)
             torch.save({
                 "input_ids": result["input_ids"],
                 "hidden_states": result["hidden_states"],
                 "loss_mask": seq["loss_mask"],
+                "top_logits_values": tk_v.cpu().to(torch.bfloat16),
+                "top_logits_indices": tk_i.cpu().to(torch.int32),
             }, str(out_path))
             processed += 1
 

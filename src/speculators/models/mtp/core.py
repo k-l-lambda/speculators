@@ -348,14 +348,27 @@ class MTPDraftModel(SpeculatorModel):
         metrics = {}
 
         if loss_type == "kl":
-            with torch.no_grad():
-                verifier_logits = self.verifier_lm_head(
-                    self.verifier_norm(verifier_last_hidden_states).to(self.verifier_lm_head.weight.dtype)
+            # Use precomputed top-K logits if available, otherwise compute on-the-fly
+            top_vals = kwargs.get("top_logits_values")
+            top_ids = kwargs.get("top_logits_indices")
+            if top_vals is not None and top_ids is not None:
+                # Reconstruct sparse verifier logits from top-K
+                # top_vals: [B, seq, K], top_ids: [B, seq, K]
+                vocab_size = self.shared_head.weight.shape[0]
+                verifier_targets = torch.full(
+                    (batch_size, seq_len, vocab_size),
+                    float("-inf"), device=device, dtype=logits.dtype,
                 )
-                verifier_targets = torch.cat([
-                    verifier_logits[:, 1:, :],
-                    verifier_logits.new_zeros(batch_size, 1, verifier_logits.shape[-1]),
-                ], dim=1)
+                verifier_targets.scatter_(2, top_ids.to(device).long(), top_vals.to(device).to(logits.dtype))
+            else:
+                with torch.no_grad():
+                    verifier_logits = self.verifier_lm_head(
+                        self.verifier_norm(verifier_last_hidden_states).to(self.verifier_lm_head.weight.dtype)
+                    )
+                    verifier_targets = torch.cat([
+                        verifier_logits[:, 1:, :],
+                        verifier_logits.new_zeros(batch_size, 1, verifier_logits.shape[-1]),
+                    ], dim=1)
             loss = mtp_loss_kl(logits, verifier_targets, adjusted_mask)
         else:
             loss = mtp_loss_ce(logits, target_ids, adjusted_mask)

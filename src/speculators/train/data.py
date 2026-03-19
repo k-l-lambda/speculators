@@ -63,7 +63,7 @@ def shift_batch(batch: BatchType):
     lengths = lengths - 1
     position_ids = position_ids[1:]  # Note: position_ids now start at 1
 
-    return {
+    result = {
         "input_ids": input_ids,
         "hidden_states": hidden_states,
         "verifier_last_hidden_states": verifier_last_hidden_states,
@@ -71,6 +71,11 @@ def shift_batch(batch: BatchType):
         "lengths": lengths,
         "position_ids": position_ids,
     }
+    # Pass through top-K verifier logits (shift to align with targets)
+    if "top_logits_values" in batch:
+        result["top_logits_values"] = batch["top_logits_values"][1:]
+        result["top_logits_indices"] = batch["top_logits_indices"][1:]
+    return result
 
 
 def split_files(datapath: str, ratio: float = 0.9, seed: int = 0):
@@ -301,10 +306,15 @@ def standardize_data_mtp(data: dict) -> dict:
     h = data['hidden_states']
     if isinstance(h, list):
         h = h[-1]  # use last layer (e.g. layer 60 for K2.5)
-    return {
+    result = {
         'hidden_states': h,
         'input_ids': data['input_ids'],
         'verifier_last_hidden_states': h,
         'loss_mask': data['loss_mask'],
     }
+    # Pass through top-K verifier logits if present
+    if 'top_logits_values' in data:
+        result['top_logits_values'] = data['top_logits_values']
+        result['top_logits_indices'] = data['top_logits_indices']
+    return result
 
