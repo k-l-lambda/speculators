@@ -129,7 +129,8 @@ def create_transformer_layer_config(
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
 
-    transformer_layer_config = config_class(
+    # Common config params
+    config_kwargs = dict(
         vocab_size=verifier_config.vocab_size,
         hidden_size=verifier_config.hidden_size,
         intermediate_size=verifier_config.intermediate_size,
@@ -142,6 +143,19 @@ def create_transformer_layer_config(
         rms_norm_eps=verifier_config.rms_norm_eps,
         head_dim=getattr(verifier_config, "head_dim", None),
     )
+    # For MLA-based architectures (kimi_k2/deepseek_v3), pass MLA-specific params
+    if draft_arch == "kimi_k2":
+        for key in [
+            "q_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim",
+            "v_head_dim", "kv_lora_rank", "rope_scaling", "rope_theta",
+            "n_routed_experts", "n_shared_experts", "num_experts_per_tok",
+            "moe_intermediate_size", "moe_layer_freq", "n_group",
+            "routed_scaling_factor", "norm_topk_prob", "scoring_func",
+            "topk_group", "topk_method", "first_k_dense_replace",
+        ]:
+            if hasattr(verifier_config, key):
+                config_kwargs[key] = getattr(verifier_config, key)
+    transformer_layer_config = config_class(**config_kwargs)
     transformer_layer_config._attn_implementation = "simple_flex_attention"  # noqa: SLF001
     return transformer_layer_config
 
