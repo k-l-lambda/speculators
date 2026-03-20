@@ -216,6 +216,16 @@ def main(args: argparse.Namespace):
         **vars(args),
     )
 
+    # Optionally initialize from pretrained weights (e.g. fine-tuning from NVIDIA Eagle3)
+    if args.pretrain_weights is not None:
+        import safetensors.torch as storch
+        pretrain_sd = storch.load_file(args.pretrain_weights)
+        missing, unexpected = draft_model.load_state_dict(pretrain_sd, strict=False)
+        log.info(
+            "Loaded pretrain weights from %s: %d loaded, %d missing, %d unexpected",
+            args.pretrain_weights, len(pretrain_sd) - len(missing), len(missing), len(unexpected),
+        )
+
     # Setup dataloaders
     train_files, val_files = split_files(args.data_path, ratio=0.9)
     train_loader = setup_dataloader(
@@ -346,6 +356,12 @@ def parse_args():
     parser.add_argument("--scheduler-total-steps", type=int, default=None)
     parser.add_argument("--scheduler-num-cosine-cycles", type=float, default=0.5)
     parser.add_argument("--loss-type", type=str, default="ce", choices=["ce", "kl"])
+    parser.add_argument(
+        "--pretrain-weights", type=str, default=None,
+        help="Path to a pretrained model.safetensors file to initialize weights from "
+             "(e.g. for fine-tuning from NVIDIA Eagle3 checkpoint). "
+             "Applied after model construction, before training starts.",
+    )
     return parser.parse_args()
 
 
