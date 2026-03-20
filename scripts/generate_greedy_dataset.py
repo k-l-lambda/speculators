@@ -19,9 +19,11 @@ Usage:
         --output-dir /data/datasets/apilog_k25_eagle3/val_5k_greedy \
         --model-path /data/models/Kimi-K2.5-MTP
 """
+import os
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 

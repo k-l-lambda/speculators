@@ -1,4 +1,6 @@
 """Extract hidden states from intermediate layers during prefill using vLLM."""
+import os
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
