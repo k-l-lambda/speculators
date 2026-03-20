@@ -209,7 +209,7 @@ class VllmHiddenStatesGenerator:
                 trust_remote_code=True,
                 dtype="auto",
                 max_model_len=max_model_len,
-                enforce_eager=True,
+                enforce_eager=kwargs.get("enforce_eager", False),
             ),
             cache_config=cache_config,
             parallel_config=ParallelConfig(
