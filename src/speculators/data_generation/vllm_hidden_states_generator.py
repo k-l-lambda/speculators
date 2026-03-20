@@ -1,5 +1,7 @@
 """Extract hidden states from intermediate layers during prefill using vLLM."""
 import os
+# vLLM defaults to fork in library mode, which breaks CUDA re-init for TP>1.
+# Must be set before any vLLM import/initialization.
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 import torch

@@ -62,7 +62,7 @@ def main():
                             layer60 = mod
                             layer60_name = name
                             break
-                except:
+                except Exception:
                     pass
             if layer60 is not None:
                 break
