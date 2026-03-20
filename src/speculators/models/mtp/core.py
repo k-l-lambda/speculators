@@ -285,7 +285,7 @@ class MTPDraftModel(SpeculatorModel):
         embed_normed = self.enorm(token_embed)
         # Zero position-0 embedding to match vLLM MTP serving behavior
         if position_ids is not None:
-            embed_normed = torch.where(position_ids.unsqueeze(-1) == 0, torch.zeros_like(embed_normed), embed_normed)
+            embed_normed = embed_normed.masked_fill(position_ids.unsqueeze(-1) == 0, 0.0)
 
         # Step 2: Normalize verifier hidden states
         hidden_normed = self.hnorm(hidden_states)
@@ -355,16 +355,16 @@ class MTPDraftModel(SpeculatorModel):
             top_vals = kwargs.get("top_logits_values")
             top_ids = kwargs.get("top_logits_indices")
             if top_vals is not None and top_ids is not None:
-                assert top_ids is not None, "top_logits_values and top_logits_indices must both be present"
-                # Gathered KL: avoid materializing dense [B, S, V] target tensor
-                # target_p = softmax(top_vals) is renormalized over top-K support
-                # KL = sum_i p_i * (log p_i - log q_i) where q_i = student probs at top-K positions
-                top_vals_dev = top_vals.to(device).to(logits.dtype)
-                top_ids_dev = top_ids.to(device).long()
-                target_p = torch.nn.functional.softmax(top_vals_dev, dim=-1)
+                # Gathered KL over top-K renormalized verifier distribution.
+                # Avoids materializing dense [B, S, V] target tensor.
+                # KL = sum_i p_i * (log p_i - log q_i), i in top-K only
+                top_vals_dev = top_vals.to(device=device, dtype=logits.dtype)
+                top_ids_dev = top_ids.to(device=device, dtype=torch.long)
+                target_log_p = torch.nn.functional.log_softmax(top_vals_dev, dim=-1)
+                target_p = target_log_p.exp()
                 student_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
                 gathered_log_q = torch.gather(student_log_probs, 2, top_ids_dev)
-                elementwise_kl = target_p * (torch.log(target_p.clamp_min(1e-10)) - gathered_log_q)
+                elementwise_kl = target_p * (target_log_p - gathered_log_q)
                 # Sum over top-K dimension, apply loss_mask
                 kl_per_token = elementwise_kl.sum(dim=-1)  # [B, S]
                 if adjusted_mask is not None:

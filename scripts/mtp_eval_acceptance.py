@@ -301,10 +301,10 @@ def build_mtp_model(config_dir, state_dict, device):
 
             x_embed = self.enorm(self.embed_tokens(x_next_ids))
             # Zero position-0 embedding to match vLLM MTP serving behavior
-            pos_for_zero = torch.arange(x_next_ids.shape[1], device=x_next_ids.device)
-            x_embed = torch.where(pos_for_zero.unsqueeze(0).unsqueeze(-1) == 0, torch.zeros_like(x_embed), x_embed)
-            if getattr(self, "zero_pos0", False):
-                x_embed[:, 0, :] = 0.0
+            x_embed = x_embed.masked_fill(
+                torch.arange(x_next_ids.shape[1], device=x_next_ids.device).unsqueeze(0).unsqueeze(-1) == 0,
+                0.0,
+            )
             h_norm = self.hnorm(h_t)
             hidden = self.eh_proj(torch.cat([x_embed, h_norm], dim=-1))
 
@@ -406,21 +406,10 @@ def evaluate_acceptance(model, data_dir, device, output_path):
         if seq_len < 3:
             continue
 
-        # Apply token-hidden alignment
+        # Apply token-hidden alignment (same shift_batch as training collate_fn)
         from speculators.train.data import shift_batch
-        if False:  # vllm_align removed
-            # vLLM alignment: (h[t], x[t+2]) — hidden_state 2 steps behind token
-            shifted_input_ids = input_ids[2:]
-            shifted_hidden = hidden_states[:-2]
-            shifted_loss_mask = loss_mask[2:] if loss_mask is not None else None
-            shifted = {
-                "input_ids": shifted_input_ids,
-                "hidden_states": shifted_hidden,
-                "loss_mask": shifted_loss_mask if shifted_loss_mask is not None else torch.ones(len(shifted_input_ids)),
-            }
-        else:
-            shifted = shift_batch(
-            {"input_ids": input_ids,
+        shifted = shift_batch({
+            "input_ids": input_ids,
             "hidden_states": hidden_states,
             "verifier_last_hidden_states": hidden_states,
             "loss_mask": loss_mask,
