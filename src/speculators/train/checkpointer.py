@@ -171,7 +171,13 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
         )
-        optimizer.load_state_dict(full_state_dict)
+        try:
+            optimizer.load_state_dict(full_state_dict)
+        except (ValueError, KeyError) as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to load optimizer state (starting fresh optimizer): %s", e
+            )
 
     def save_checkpoint(
         self,
@@ -223,12 +229,18 @@ class DistributedCheckpointer(BaseCheckpointer):
             full_state_dict, float_dtype or model.dtype
         )
 
-        set_optimizer_state_dict(
-            model,
-            optimizer,
-            full_state_dict,
-            options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
-        )
+        try:
+            set_optimizer_state_dict(
+                model,
+                optimizer,
+                full_state_dict,
+                options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
+            )
+        except (ValueError, KeyError) as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to load optimizer state (starting fresh optimizer): %s", e
+            )
         dist.barrier()
 
     def save_checkpoint(
