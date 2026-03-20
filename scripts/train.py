@@ -156,7 +156,11 @@ def create_transformer_layer_config(
             if hasattr(verifier_config, key):
                 config_kwargs[key] = getattr(verifier_config, key)
     transformer_layer_config = config_class(**config_kwargs)
-    transformer_layer_config._attn_implementation = "simple_flex_attention"  # noqa: SLF001
+    # kimi_k2 uses eager attention (MLA doesn't support flex_attention)
+    if draft_arch == "kimi_k2":
+        transformer_layer_config._attn_implementation = "eager"  # noqa: SLF001
+    else:
+        transformer_layer_config._attn_implementation = "simple_flex_attention"  # noqa: SLF001
     return transformer_layer_config
 
 
