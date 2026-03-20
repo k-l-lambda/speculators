@@ -219,10 +219,11 @@ def main(args: argparse.Namespace):
     # Optionally initialize from pretrained weights (e.g. fine-tuning from NVIDIA Eagle3)
     if args.pretrain_weights is not None:
         import safetensors.torch as storch
+        from loguru import logger as _log
         pretrain_sd = storch.load_file(args.pretrain_weights)
         missing, unexpected = draft_model.load_state_dict(pretrain_sd, strict=False)
-        log.info(
-            "Loaded pretrain weights from %s: %d loaded, %d missing, %d unexpected",
+        _log.info(
+            "Loaded pretrain weights from {}: {} loaded, {} missing, {} unexpected",
             args.pretrain_weights, len(pretrain_sd) - len(missing), len(missing), len(unexpected),
         )
 
