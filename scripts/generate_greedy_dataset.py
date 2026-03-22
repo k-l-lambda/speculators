@@ -42,6 +42,8 @@ def parse_args():
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--tensor-parallel-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--enforce-eager", dest="enforce_eager", action="store_true", default=True)
+    parser.add_argument("--no-enforce-eager", dest="enforce_eager", action="store_false", help="Use compiled+CUDAGraph mode (default: eager)")
     parser.add_argument("--layer-ids", type=int, nargs="+", default=[2, 30, 58, 60])
     return parser.parse_args()
 
@@ -168,6 +170,7 @@ def step_extract(args):
         max_model_len=args.max_model_len,
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=0.85,
+        enforce_eager=args.enforce_eager,
     )
     print("Generator ready")
 

@@ -83,9 +83,11 @@ class VllmHiddenStatesGenerator:
         gpu_memory_utilization: float = 0.8,
         tensor_parallel_size: int = 1,
         max_num_batched_tokens: int | None = None,
+        enforce_eager: bool = True,
     ):
         self.model_path = model_path
         self.tensor_parallel_size = tensor_parallel_size
+        self.enforce_eager = enforce_eager
         self._request_counter = 0
 
         log.info(f"Initializing hidden states generator for {model_path}")
@@ -125,6 +127,7 @@ class VllmHiddenStatesGenerator:
             gpu_memory_utilization=gpu_memory_utilization,
             tensor_parallel_size=tensor_parallel_size,
             max_num_batched_tokens=max_num_batched_tokens,
+            enforce_eager=enforce_eager,
         )
 
         log.info("Initializing executor...")
@@ -185,6 +188,7 @@ class VllmHiddenStatesGenerator:
         gpu_memory_utilization: float,
         tensor_parallel_size: int,
         max_num_batched_tokens: int | None = None,
+        enforce_eager: bool = True,
     ) -> VllmConfig:
         """Create VllmConfig with hidden states worker extension"""
         cache_config = CacheConfig(
@@ -209,7 +213,7 @@ class VllmHiddenStatesGenerator:
                 trust_remote_code=True,
                 dtype="auto",
                 max_model_len=max_model_len,
-                enforce_eager=kwargs.get("enforce_eager", False),
+                enforce_eager=enforce_eager,
             ),
             cache_config=cache_config,
             parallel_config=ParallelConfig(
