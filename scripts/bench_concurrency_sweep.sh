@@ -58,6 +58,7 @@ echo "Concurrencies: $CONCURRENCIES"
 echo ""
 
 for C in $CONCURRENCIES; do
+    check_power_cap
     echo "--- Concurrency=$C ---"
     $VLLM_BIN bench serve \
         --backend openai-chat \
