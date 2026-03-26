@@ -34,6 +34,21 @@ if ! curl -s http://localhost:8200/health > /dev/null 2>&1; then
     exit 1
 fi
 
+# Check GPU sw_power_cap throttling (indicates degraded performance, need reboot)
+check_power_cap() {
+    local throttled
+    throttled=$(nvidia-smi --query-gpu=index,clocks_throttle_reasons.sw_power_cap --format=csv,noheader 2>/dev/null \
+        | grep -i "active" | grep -v "Not Active" || true)
+    if [ -n "$throttled" ]; then
+        echo "ERROR: GPU sw_power_cap throttling detected! Performance will be degraded (~2x)." >&2
+        echo "Affected GPUs:" >&2
+        echo "$throttled" >&2
+        echo "Fix: reboot the machine before benchmarking." >&2
+        exit 1
+    fi
+}
+check_power_cap
+
 RESULT_DIR="/tmp/vllm_bench_${LABEL}"
 mkdir -p "$RESULT_DIR"
 
