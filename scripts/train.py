@@ -261,21 +261,34 @@ def main(args: argparse.Namespace):
             raise ValueError("--train-data-path is required for --dynamic mode")
 
         import logging
+        from datasets import load_from_disk
         _dyn_log = logging.getLogger("speculators")
 
-        # 1. Load and preprocess dataset (same as data_generation_offline.py)
-        from speculators.data_generation.preprocessing import load_and_preprocess_dataset
-        _dyn_log.info(
-            "Loading and preprocessing dataset from %s ...", args.train_data_path
-        )
-        hf_dataset, _tokenizer = load_and_preprocess_dataset(
-            target_model_path=args.target_model_path,
-            train_data_path=args.train_data_path,
-            seq_length=args.seq_length,
-            max_samples=None,
-            seed=args.seed,
-        )
-        _dyn_log.info("Dataset: %d samples", len(hf_dataset))
+        # 1. Load dataset: either pre-tokenized HF dataset or raw conversations
+        import os
+        if os.path.isdir(args.train_data_path) and os.path.exists(
+            os.path.join(args.train_data_path, "dataset_info.json")
+        ):
+            # Pre-tokenized HF dataset with input_ids + loss_mask columns
+            _dyn_log.info(
+                "Loading pre-tokenized HF dataset from %s ...", args.train_data_path
+            )
+            hf_dataset = load_from_disk(args.train_data_path)
+            _dyn_log.info("Dataset: %d samples", len(hf_dataset))
+        else:
+            # Raw conversation dataset — tokenize via preprocessing pipeline
+            from speculators.data_generation.preprocessing import load_and_preprocess_dataset
+            _dyn_log.info(
+                "Loading and preprocessing dataset from %s ...", args.train_data_path
+            )
+            hf_dataset, _tokenizer = load_and_preprocess_dataset(
+                target_model_path=args.target_model_path,
+                train_data_path=args.train_data_path,
+                seq_length=args.seq_length,
+                max_samples=None,
+                seed=args.seed,
+            )
+            _dyn_log.info("Dataset: %d samples", len(hf_dataset))
 
         # 2. Split into train/val
         n_val = int(len(hf_dataset) * args.val_ratio)
