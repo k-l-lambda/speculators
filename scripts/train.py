@@ -344,6 +344,7 @@ def main(args: argparse.Namespace):
             max_model_len=args.seq_length,
             gpu_memory_utilization=args.gpu_memory_utilization,
             tensor_parallel_size=args.tensor_parallel_size,
+            enforce_eager=args.enforce_eager,
         )
         _dyn_log.info("VllmHiddenStatesGenerator ready")
 
@@ -523,6 +524,12 @@ def parse_args():
     parser.add_argument(
         "--val-ratio", type=float, default=0.1,
         help="[dynamic] Fraction of dataset to use for validation (default: 0.1)",
+    )
+    parser.add_argument(
+        "--enforce-eager", action="store_true", default=False,
+        help="[dynamic] Force eager mode for vLLM (disable CUDA graphs/compile). "
+             "Default: False (use compiled mode for better performance and "
+             "consistency with production inference).",
     )
 
     return parser.parse_args()
