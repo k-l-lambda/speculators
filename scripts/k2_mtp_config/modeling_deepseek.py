@@ -1134,9 +1134,110 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         )
 
 
+class DeepseekV3SdpaAttention(DeepseekV3Attention):
+    """DeepseekV3 attention using PyTorch's scaled_dot_product_attention (memory-efficient).
+
+    Supports 4-D attention masks natively (required for packed-sequence training).
+    Falls back to the efficient FlashAttention or MemoryEfficientAttention kernels
+    built into PyTorch ≥ 2.0, avoiding O(n²) materialization of the attention matrix.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # SDPA does not support output_attentions; fall back to eager
+            return super().forward(
+                hidden_states, attention_mask=attention_mask,
+                position_ids=position_ids, past_key_value=past_key_value,
+                output_attentions=output_attentions, use_cache=use_cache,
+                **kwargs,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        if self.q_lora_rank is None:
+            q = self.q_proj(hidden_states)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        compressed_kv, k_pe = torch.split(
+            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        kv = (self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
+            bsz, q_len, self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2))
+
+        k_nope, value_states = torch.split(
+            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        kv_seq_len = value_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    "The cache structure has changed since version v4.36. "
+                    "Please make sure to provide a `layer_idx`.")
+            kv_seq_len += get_usable_length(past_key_value, kv_seq_len,
+                                            self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+
+        query_states = k_pe.new_empty(bsz, self.num_heads, q_len,
+                                      self.q_head_dim)
+        query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
+        query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
+
+        key_states = k_pe.new_empty(bsz, self.num_heads, q_len,
+                                    self.q_head_dim)
+        key_states[:, :, :, :self.qk_nope_head_dim] = k_nope
+        key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs)
+
+        # SDPA requires Q and K to have the same head_dim as V for the output.
+        # MLA has q_head_dim != v_head_dim, so we pad V to match.
+        if self.q_head_dim != self.v_head_dim:
+            value_states = F.pad(value_states,
+                                 [0, self.q_head_dim - self.v_head_dim])
+
+        # SDPA expects attn_mask where True/0.0 = attend, large-negative = ignore.
+        # The 4-D mask from build_packed_attention_mask() is already in this format.
+        attn_output = F.scaled_dot_product_attention(
+            query_states, key_states, value_states,
+            attn_mask=attention_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            scale=self.softmax_scale,
+        )
+
+        if self.q_head_dim != self.v_head_dim:
+            attn_output = attn_output[:, :, :, :self.v_head_dim]
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len,
+                                          self.num_heads * self.v_head_dim)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+
 ATTENTION_CLASSES = {
     "eager": DeepseekV3Attention,
     "flash_attention_2": DeepseekV3FlashAttention2,
+    "sdpa": DeepseekV3SdpaAttention,
 }
 
 

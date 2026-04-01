@@ -160,8 +160,8 @@ try:
                 layer_idx: int,
                 norm_before_residual: bool = False,
             ):
-                # Set eager attention to avoid flash attention issues during training
-                config._attn_implementation = "eager"
+                # Use SDPA for memory-efficient attention (eager OOMs on long packed sequences)
+                config._attn_implementation = "sdpa"
                 super().__init__(config, layer_idx)
                 self._patch_eagle3_projections_mla(config, _DsRMSNorm, norm_before_residual)
 
