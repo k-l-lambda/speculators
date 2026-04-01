@@ -1211,6 +1211,9 @@ class DeepseekV3SdpaAttention(DeepseekV3Attention):
         # SDPA requires Q and K to have the same head_dim as V for the output.
         # MLA has q_head_dim != v_head_dim, so we pad V to match.
         if self.q_head_dim != self.v_head_dim:
+            assert self.q_head_dim > self.v_head_dim, (
+                f"SDPA MLA padding requires q_head_dim ({self.q_head_dim}) >= "
+                f"v_head_dim ({self.v_head_dim})")
             value_states = F.pad(value_states,
                                  [0, self.q_head_dim - self.v_head_dim])
 

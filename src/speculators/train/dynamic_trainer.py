@@ -12,7 +12,6 @@ import threading
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from torch.utils.data import DataLoader
 from tqdm import TqdmExperimentalWarning  # noqa: F401
 from tqdm.rich import tqdm
@@ -21,7 +20,6 @@ from speculators.data_generation.vllm_hidden_states_generator import (
     VllmHiddenStatesGenerator,
 )
 from speculators.model import SpeculatorModel
-from speculators.train.checkpointer import SingleGPUCheckpointer
 from speculators.train.data import (
     BatchType,
     StandardizeFnSig,
@@ -60,12 +58,16 @@ class DynamicBatchPrefetcher:
         self._thread: threading.Thread | None = None
         self._epoch: int = 0
         self._error: BaseException | None = None
+        self._skipped: int = 0
+        self._total: int = 0
 
     def start(self, epoch: int):
         """Start prefetching for an epoch."""
         self._epoch = epoch
         self._stop_event.clear()
         self._error = None
+        self._skipped = 0
+        self._total = 0
         # Drain any leftover items from previous epoch
         while not self._queue.empty():
             try:
@@ -78,9 +80,25 @@ class DynamicBatchPrefetcher:
     def stop(self):
         """Signal the producer to stop and wait for it."""
         self._stop_event.set()
+        # Drain queue so producer can unblock from put()
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
         if self._thread is not None:
             self._thread.join(timeout=30)
             self._thread = None
+
+    def _put(self, item):
+        """Put item into queue, respecting stop event to avoid deadlock."""
+        while not self._stop_event.is_set():
+            try:
+                self._queue.put(item, timeout=1.0)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def _producer(self):
         """Background thread: iterate dataloader, generate batches, enqueue."""
@@ -93,16 +111,20 @@ class DynamicBatchPrefetcher:
                     break
                 try:
                     gpu_batch = self.generate_fn(batch)
-                    self._queue.put(gpu_batch)
+                    if not self._put(gpu_batch):
+                        break
                 except Exception as e:
                     root_logger.error(f"Generation failed in prefetcher: {e}")
-                    # Put None to signal error but continue
-                    self._queue.put(None)
+                    if not self._put(None):
+                        break
         except Exception as e:
             self._error = e
         finally:
-            # Sentinel to signal end of epoch
-            self._queue.put(StopIteration)
+            # Sentinel to signal end of epoch — must always be sent
+            try:
+                self._queue.put(StopIteration, timeout=5.0)
+            except queue.Full:
+                pass
 
     def __iter__(self):
         return self
@@ -110,11 +132,26 @@ class DynamicBatchPrefetcher:
     def __next__(self) -> BatchType:
         if self._error is not None:
             raise self._error
-        item = self._queue.get()
+        try:
+            item = self._queue.get(timeout=300)
+        except queue.Empty:
+            raise RuntimeError("Prefetcher timed out waiting for batch (300s)")
         if item is StopIteration:
+            if self._skipped > 0:
+                root_logger.warning(
+                    f"Epoch {self._epoch}: skipped {self._skipped}/{self._total} "
+                    f"batches ({self._skipped / max(self._total, 1) * 100:.1f}%)"
+                )
             raise StopIteration
+        self._total += 1
         if item is None:
             # Generation failed for this batch, skip
+            self._skipped += 1
+            if self._total >= 10 and self._skipped / self._total > 0.5:
+                raise RuntimeError(
+                    f"Too many batch failures: {self._skipped}/{self._total} "
+                    f"({self._skipped / self._total * 100:.0f}%) — aborting epoch"
+                )
             return self.__next__()
         return item
 
