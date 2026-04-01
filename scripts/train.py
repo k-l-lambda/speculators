@@ -231,27 +231,6 @@ def main(args: argparse.Namespace):
             args.pretrain_weights, len(pretrain_sd) - len(missing), len(missing), len(unexpected),
         )
 
-    # Setup dataloaders
-    train_files, val_files = split_files(args.data_path, ratio=0.9)
-    train_loader = setup_dataloader(
-        train_files,
-        world_size,
-        local_rank,
-        add_noise=True,
-        noise_std=args.noise_std,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
-    val_loader = setup_dataloader(
-        val_files,
-        world_size,
-        local_rank,
-        add_noise=False,
-        noise_std=args.noise_std,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
-
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
 
@@ -269,7 +248,135 @@ def main(args: argparse.Namespace):
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
     )
-    trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
+
+    if args.dynamic:
+        # ---- Dynamic hidden states training ----
+        assert not is_distributed, (
+            "Dynamic training only supports single-GPU "
+            "(vLLM uses TP for other GPUs). Do not use torchrun."
+        )
+        if not args.target_model_path:
+            raise ValueError("--target-model-path is required for --dynamic mode")
+        if not args.train_data_path:
+            raise ValueError("--train-data-path is required for --dynamic mode")
+
+        import logging
+        _dyn_log = logging.getLogger("speculators")
+
+        # 1. Load and preprocess dataset (same as data_generation_offline.py)
+        from speculators.data_generation.preprocessing import load_and_preprocess_dataset
+        _dyn_log.info(
+            "Loading and preprocessing dataset from %s ...", args.train_data_path
+        )
+        hf_dataset, _tokenizer = load_and_preprocess_dataset(
+            target_model_path=args.target_model_path,
+            train_data_path=args.train_data_path,
+            seq_length=args.seq_length,
+            max_samples=None,
+            seed=args.seed,
+        )
+        _dyn_log.info("Dataset: %d samples", len(hf_dataset))
+
+        # 2. Split into train/val
+        n_val = int(len(hf_dataset) * args.val_ratio)
+        n_train = len(hf_dataset) - n_val
+        train_hf = hf_dataset.select(range(n_train))
+        val_hf = hf_dataset.select(range(n_train, len(hf_dataset)))
+        _dyn_log.info("Split: %d train, %d val", len(train_hf), len(val_hf))
+
+        # 3. Create lightweight dataloaders
+        from speculators.train.data import (
+            DynamicEagle3Dataset,
+            create_dynamic_collate_fn,
+        )
+
+        train_ds = DynamicEagle3Dataset(train_hf, args.total_seq_len)
+        val_ds = DynamicEagle3Dataset(val_hf, args.total_seq_len)
+
+        train_sampler = MultipackDistributedBatchSamplerV2(
+            batch_max_length=args.total_seq_len,
+            lengths=train_ds.approx_lengths,
+            num_replicas=1,
+            rank=0,
+        )
+        val_sampler = MultipackDistributedBatchSamplerV2(
+            batch_max_length=args.total_seq_len,
+            lengths=val_ds.approx_lengths,
+            num_replicas=1,
+            rank=0,
+        )
+
+        dynamic_collate = create_dynamic_collate_fn(args.total_seq_len)
+        # num_workers=0: vLLM CUDA context lives in main process
+        train_loader = DataLoader(
+            train_ds, batch_sampler=train_sampler,
+            collate_fn=dynamic_collate, num_workers=0,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_sampler=val_sampler,
+            collate_fn=dynamic_collate, num_workers=0,
+        )
+
+        # 4. Initialize VllmHiddenStatesGenerator
+        from speculators.data_generation.vllm_hidden_states_generator import (
+            VllmHiddenStatesGenerator,
+        )
+        _dyn_log.info(
+            "Initializing VllmHiddenStatesGenerator (TP=%d, gpu_mem=%.1f%%) ...",
+            args.tensor_parallel_size, args.gpu_memory_utilization * 100,
+        )
+        generator = VllmHiddenStatesGenerator(
+            model_path=args.target_model_path,
+            layer_ids=args.layer_ids,
+            max_model_len=args.seq_length,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            tensor_parallel_size=args.tensor_parallel_size,
+        )
+        _dyn_log.info("VllmHiddenStatesGenerator ready")
+
+        # 5. Setup noise transform
+        noise_transform = AddUniformNoise(
+            std=args.noise_std,
+            tensors=("hidden_states", "verifier_last_hidden_states"),
+        ) if args.noise_std > 0 else None
+
+        # 6. Create DynamicTrainer
+        from speculators.train.dynamic_trainer import DynamicTrainer
+
+        standardize_fn = standardize_data_mtp if args.speculator_type == "mtp" else standardize_data_v1
+
+        trainer = DynamicTrainer(
+            model=draft_model,
+            config=trainer_config,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            generator=generator,
+            noise_transform=noise_transform,
+            standardize_fn=standardize_fn,
+            max_len=args.total_seq_len,
+        )
+    else:
+        # ---- Offline training (existing path) ----
+        train_files, val_files = split_files(args.data_path, ratio=0.9)
+        train_loader = setup_dataloader(
+            train_files,
+            world_size,
+            local_rank,
+            add_noise=True,
+            noise_std=args.noise_std,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+        val_loader = setup_dataloader(
+            val_files,
+            world_size,
+            local_rank,
+            add_noise=False,
+            noise_std=args.noise_std,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+        )
+        trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
     # Run training
     trainer.run_training()
@@ -367,6 +474,44 @@ def parse_args():
              "(e.g. for fine-tuning from NVIDIA Eagle3 checkpoint). "
              "Applied after model construction, before training starts.",
     )
+
+    # Dynamic hidden states training arguments
+    parser.add_argument(
+        "--dynamic", action="store_true",
+        help="Enable dynamic hidden states generation during training. "
+             "Generates hidden states on-the-fly via VllmHiddenStatesGenerator "
+             "instead of loading pre-extracted .pt files. Requires single-GPU "
+             "(vLLM uses TP for other GPUs).",
+    )
+    parser.add_argument(
+        "--target-model-path", type=str, default=None,
+        help="[dynamic] Path to verifier model for vLLM hidden states generation",
+    )
+    parser.add_argument(
+        "--train-data-path", type=str, default=None,
+        help="[dynamic] HF dataset name or path for training data (e.g., 'sharegpt')",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization", type=float, default=0.3,
+        help="[dynamic] vLLM GPU memory fraction (default: 0.3)",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size", type=int, default=8,
+        help="[dynamic] TP size for vLLM (default: 8)",
+    )
+    parser.add_argument(
+        "--layer-ids", type=int, nargs="+", default=None,
+        help="[dynamic] Layer IDs for hidden states capture (default: auto)",
+    )
+    parser.add_argument(
+        "--seq-length", type=int, default=2048,
+        help="[dynamic] Max sequence length for vLLM (default: 2048)",
+    )
+    parser.add_argument(
+        "--val-ratio", type=float, default=0.1,
+        help="[dynamic] Fraction of dataset to use for validation (default: 0.1)",
+    )
+
     return parser.parse_args()
 
 

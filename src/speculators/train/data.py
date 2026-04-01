@@ -296,6 +296,122 @@ def create_collate_fn(max_len: int):
 
 
 
+def process_generated_sample(
+    raw_data: dict[str, Any],
+    loss_mask: torch.Tensor,
+    standardize_fn: StandardizeFnSig = standardize_data_v1,
+    transform: TransformTensors | None = None,
+    hidden_states_dtype: torch.dtype = torch.float,
+) -> BatchType:
+    """Process a single sample from VllmHiddenStatesGenerator into a training-ready batch item.
+
+    This is the shared preprocessing path used by both offline (Eagle3SampleFileDataset)
+    and dynamic (DynamicTrainer) training to ensure identical data transformation.
+
+    Args:
+        raw_data: Dict with keys "input_ids" (Tensor[seq]), "hidden_states" (list of Tensors),
+                  and optionally "loss_mask".
+        loss_mask: External loss mask tensor to use (from dataset preprocessing).
+        standardize_fn: Standardization function (e.g. standardize_data_v1).
+        transform: Optional noise transform (e.g. AddUniformNoise).
+        hidden_states_dtype: Target dtype for hidden states tensors.
+
+    Returns:
+        Shifted, ready-to-collate batch dict with keys:
+        {hidden_states, input_ids, verifier_last_hidden_states, loss_mask, lengths, position_ids}
+    """
+    seq_len = len(raw_data["input_ids"])
+
+    # Merge external loss_mask (generator returns None)
+    data = {
+        "input_ids": raw_data["input_ids"],
+        "hidden_states": raw_data["hidden_states"],
+        "loss_mask": loss_mask[:seq_len],
+    }
+
+    data = standardize_fn(data)
+
+    # Convert hidden states dtype (same as Eagle3SampleFileDataset.__getitem__)
+    data = {
+        k: v.to(hidden_states_dtype) if "hidden_states" in k else v
+        for k, v in data.items()
+    }
+
+    # Add lengths and position_ids
+    out_seq_len = data["input_ids"].shape[0]
+    data["lengths"] = torch.tensor([out_seq_len], dtype=torch.long)
+    data["position_ids"] = torch.arange(out_seq_len, dtype=torch.long)
+
+    # Apply noise transform
+    if transform:
+        data = transform(data)
+
+    return shift_batch(data)
+
+
+class DynamicEagle3Dataset(Dataset):
+    """Dataset for dynamic hidden states training.
+
+    Provides only input_ids + loss_mask (no hidden_states).
+    Hidden states are generated on-the-fly by VllmHiddenStatesGenerator in the trainer.
+    """
+
+    def __init__(self, hf_dataset, max_len: int):
+        """
+        Args:
+            hf_dataset: HuggingFace Dataset with columns "input_ids" and "loss_mask".
+            max_len: Maximum sequence length.
+        """
+        self.hf_dataset = hf_dataset
+        self.max_len = max_len
+        self.approx_lengths = [
+            min(len(row["input_ids"]), max_len) for row in hf_dataset
+        ]
+
+    def __len__(self):
+        return len(self.hf_dataset)
+
+    def __getitem__(self, index) -> BatchType:
+        row = self.hf_dataset[index]
+        input_ids = torch.tensor(row["input_ids"], dtype=torch.long)
+        loss_mask = torch.tensor(row["loss_mask"], dtype=torch.long)
+        seq_len = min(len(input_ids), self.max_len)
+        return {
+            "input_ids": input_ids[:seq_len],
+            "loss_mask": loss_mask[:seq_len],
+            "lengths": torch.tensor([seq_len], dtype=torch.long),
+        }
+
+
+def create_dynamic_collate_fn(max_len: int):
+    """Collate function for DynamicEagle3Dataset: packs input_ids + loss_mask only."""
+
+    def collate_fn(batch: list[BatchType]) -> BatchType:
+        collated: BatchType = {}
+        for key in batch[0]:
+            collated[key] = torch.cat([b[key] for b in batch], dim=0)
+            if key != "lengths":
+                collated[key] = slice_and_pad_to_length(
+                    collated[key], max_len
+                ).unsqueeze(0)
+
+        # Truncate lengths to fit max_len (same logic as create_collate_fn)
+        lengths = collated["lengths"]
+        new_lengths: list[int] = []
+        cum = 0
+        for length in lengths:
+            l_val = length.item()
+            if l_val + cum >= max_len:
+                new_lengths.append(max_len - cum)
+                break
+            new_lengths.append(l_val)
+            cum += l_val
+        collated["lengths"] = torch.tensor(new_lengths, dtype=torch.long)
+        return collated
+
+    return collate_fn
+
+
 def standardize_data_mtp(data: dict) -> dict:
     # MTP data format (single hidden state layer):
     # {
