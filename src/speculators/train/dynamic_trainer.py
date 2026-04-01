@@ -147,7 +147,7 @@ class DynamicBatchPrefetcher:
         if item is None:
             # Generation failed for this batch, skip
             self._skipped += 1
-            if self._total >= 10 and self._skipped / self._total > 0.5:
+            if self._total >= 50 and self._skipped / self._total > 0.5:
                 raise RuntimeError(
                     f"Too many batch failures: {self._skipped}/{self._total} "
                     f"({self._skipped / self._total * 100:.0f}%) — aborting epoch"

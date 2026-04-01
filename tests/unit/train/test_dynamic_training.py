@@ -421,13 +421,13 @@ class TestDynamicBatchPrefetcher:
         assert results == []
 
     def test_skip_rate_abort(self):
-        """Prefetcher aborts if >50% of batches fail after 10+ attempts."""
+        """Prefetcher aborts if >50% of batches fail after 50+ attempts."""
         from speculators.train.dynamic_trainer import DynamicBatchPrefetcher
 
-        batches = [{"id": i} for i in range(20)]
+        batches = [{"id": i} for i in range(80)]
         fake_loader = MagicMock()
         fake_loader.__iter__ = MagicMock(return_value=iter(batches))
-        fake_loader.__len__ = MagicMock(return_value=20)
+        fake_loader.__len__ = MagicMock(return_value=80)
         fake_loader.batch_sampler = MagicMock(spec=[])
 
         # Fail 80% of batches
