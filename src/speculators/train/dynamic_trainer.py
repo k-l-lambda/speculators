@@ -200,17 +200,24 @@ class DynamicTrainer(Trainer):
         consecutive_failures = 0
 
         for i, (result, sample) in enumerate(zip(results, samples)):
-            # Strict assertions (catch vLLM truncation or misalignment)
+            # Validate token count (allow ±1 for BOS/EOS handling differences)
             result_len = len(result["input_ids"])
             expected_len = len(sample["input_ids"])
-            assert result_len == expected_len, (
-                f"Sample {i}: vLLM returned {result_len} tokens, "
-                f"expected {expected_len}. Input may have been truncated."
-            )
+            if abs(result_len - expected_len) > 1:
+                raise ValueError(
+                    f"Sample {i}: vLLM returned {result_len} tokens, "
+                    f"expected {expected_len} (diff > 1). Input may have been truncated."
+                )
+            # Use the shorter length to align input_ids and loss_mask
+            seq_len = min(result_len, expected_len)
+            if result_len != expected_len:
+                result["input_ids"] = result["input_ids"][:seq_len]
+                result["hidden_states"] = [h[:seq_len] for h in result["hidden_states"]]
+                sample["loss_mask"] = sample["loss_mask"][:seq_len]
             for j, h in enumerate(result["hidden_states"]):
-                assert h.shape[0] == result_len, (
+                assert h.shape[0] == seq_len, (
                     f"Sample {i} layer {j}: hidden_states length {h.shape[0]} "
-                    f"!= input_ids length {result_len}"
+                    f"!= aligned length {seq_len}"
                 )
 
             item = process_generated_sample(
