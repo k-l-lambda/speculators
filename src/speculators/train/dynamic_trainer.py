@@ -229,7 +229,9 @@ class DynamicTrainer(Trainer):
 
         # 2. Generate hidden states
         token_ids_list = [s["input_ids"].tolist() for s in samples]
+        input_lens = [len(ids) for ids in token_ids_list]
         results = self.generator.generate(token_ids_list)
+        result_lens = [len(r["input_ids"]) for r in results]
 
         # 3. Process each sample through shared pipeline
         transform = self.noise_transform if apply_noise else None
@@ -243,7 +245,9 @@ class DynamicTrainer(Trainer):
             if abs(result_len - expected_len) > 1:
                 raise ValueError(
                     f"Sample {i}: vLLM returned {result_len} tokens, "
-                    f"expected {expected_len} (diff > 1). Input may have been truncated."
+                    f"expected {expected_len} (diff > 1). "
+                    f"Batch: {len(samples)} samples, input_lens={input_lens}, "
+                    f"result_lens={result_lens}"
                 )
             # Use the shorter length to align input_ids and loss_mask
             seq_len = min(result_len, expected_len)
