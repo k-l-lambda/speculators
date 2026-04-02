@@ -480,3 +480,39 @@ class TestCollateParity:
         # Batch dimension added
         assert batch["input_ids"].dim() == 2
         assert batch["hidden_states"].dim() == 3
+
+
+# ── Request ID ordering regression test ─────────────────────────────────
+
+class TestRequestIdOrdering:
+    """Regression test for request ID ordering bug.
+
+    When a batch has ≥10 samples, string-sorting request IDs like
+    "req_5_0", "req_5_1", ..., "req_5_10" produces wrong order because
+    "req_5_10" < "req_5_2" lexicographically. The fix sorts by the
+    original index stored in request_id_to_idx.
+    """
+
+    def test_sort_by_index_not_string(self):
+        """Verify sorted(..., key=lambda k: request_id_to_idx[k]) preserves input order."""
+        # Simulate 12-sample batch (triggers the bug with pure string sort)
+        counter = 5
+        request_id_to_idx = {}
+        for i in range(12):
+            req_id = f"req_{counter}_{i}"
+            request_id_to_idx[req_id] = i
+
+        # Fixed sort: by original index
+        fixed_order = sorted(request_id_to_idx.keys(), key=lambda k: request_id_to_idx[k])
+        indices_fixed = [request_id_to_idx[k] for k in fixed_order]
+        assert indices_fixed == list(range(12)), (
+            f"Fixed sort should produce [0..11], got {indices_fixed}"
+        )
+
+        # Verify the old bug: pure string sort gives wrong order
+        string_order = sorted(request_id_to_idx.keys())
+        indices_string = [request_id_to_idx[k] for k in string_order]
+        assert indices_string != list(range(12)), (
+            "String sort should NOT produce correct order for ≥10 samples "
+            "(this confirms the bug existed)"
+        )

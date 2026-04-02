@@ -341,7 +341,7 @@ class VllmHiddenStatesGenerator:
 
         # Map results back to original input order
         results = []
-        for req_id in sorted(request_id_to_idx.keys()):
+        for req_id in sorted(request_id_to_idx.keys(), key=lambda k: request_id_to_idx[k]):
             i = request_id_to_idx[req_id]
 
             if req_id not in request_states_dict:
