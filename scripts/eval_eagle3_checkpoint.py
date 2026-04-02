@@ -87,6 +87,11 @@ def main():
     all_metrics = {}
     num_valid = 0
 
+    # Length bucket tracking: <=1K, <=2K, <=4K, <=8K
+    LEN_BUCKETS = [1024, 2048, 4096, 8192]
+    bucket_metrics = {b: {} for b in LEN_BUCKETS}
+    bucket_counts = {b: 0 for b in LEN_BUCKETS}
+
     with torch.no_grad():
         for pt_file in tqdm(pt_files, desc="Evaluating"):
             raw = torch.load(str(pt_file), map_location="cpu", weights_only=False)
@@ -124,10 +129,17 @@ def main():
                 continue
 
             for k, v in metrics.items():
-                all_metrics[k] = all_metrics.get(k, 0.0) + (
-                    v.item() if isinstance(v, torch.Tensor) else v
-                )
+                val = v.item() if isinstance(v, torch.Tensor) else v
+                all_metrics[k] = all_metrics.get(k, 0.0) + val
             num_valid += 1
+
+            # Accumulate per-bucket metrics
+            for b in LEN_BUCKETS:
+                if seq_len <= b:
+                    for k, v in metrics.items():
+                        val = v.item() if isinstance(v, torch.Tensor) else v
+                        bucket_metrics[b][k] = bucket_metrics[b].get(k, 0.0) + val
+                    bucket_counts[b] += 1
 
             if num_valid % 200 == 0:
                 torch.cuda.empty_cache()
@@ -146,6 +158,30 @@ def main():
     print(f"  ttt_steps:     {args.ttt_steps}")
     for k in sorted(avg.keys()):
         print(f"  {k:30s}: {avg[k]:.4f}")
+
+    # Per-bucket results
+    print("\n" + "-" * 60)
+    print("Results by sequence length bucket")
+    print("-" * 60)
+    # Determine which metric keys to show (cond_acc and loss)
+    acc_keys = sorted(k for k in avg if k.startswith("cond_acc"))
+    header = f"  {'Bucket':>8s}  {'N':>5s}"
+    for k in acc_keys:
+        header += f"  {k:>10s}"
+    print(header)
+    prev_count = 0
+    for b in LEN_BUCKETS:
+        n = bucket_counts[b]
+        exclusive_n = n - prev_count  # samples in (prev_b, b]
+        if n == 0:
+            prev_count = n
+            continue
+        bavg = {k: v / n for k, v in bucket_metrics[b].items()}
+        row = f"  {'<=' + str(b):>8s}  {n:>5d}"
+        for k in acc_keys:
+            row += f"  {bavg.get(k, 0.0):>10.4f}"
+        print(row)
+        prev_count = n
 
 
 if __name__ == "__main__":
