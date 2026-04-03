@@ -160,8 +160,9 @@ def _fast_tokenize_row(tokenizer, row: dict, seq_length: int, min_response_token
     The row's `response` (output_tokens) is the final assistant turn.
     All message roles (including tool/tool_result) are kept as-is for context.
 
-    If the full sequence exceeds seq_length, left-truncation is applied:
-    the prefix is trimmed from the left, preserving the response at the end.
+    If the full sequence exceeds seq_length, right-truncation is applied:
+    the response is trimmed from the right, preserving the full prefix.
+    This keeps the context identical to what K2.5 saw during generation.
 
     Returns (input_ids: list, loss_mask: list) or None on error.
     """
@@ -198,19 +199,19 @@ def _fast_tokenize_row(tokenizer, row: dict, seq_length: int, min_response_token
     if len(resp_ids) < min_response_tokens:
         return None
 
-    # Left-truncation: keep rightmost prefix tokens + full response
-    max_prefix = seq_length - len(resp_ids)
-    if max_prefix <= 0:
-        resp_ids = resp_ids[:seq_length - 16]
-        max_prefix = 16
-    if prefix_len > max_prefix:
-        prefix_ids_trimmed = prefix_ids[-max_prefix:]
-    else:
-        prefix_ids_trimmed = prefix_ids
+    # Right-truncation: keep full prefix, truncate response from the right
+    # This preserves the original generation context for K2.5 hidden states.
+    if prefix_len >= seq_length:
+        return None  # prefix alone exceeds seq_length — skip sample
+    max_resp = seq_length - prefix_len
+    resp_ids = resp_ids[:max_resp]
 
-    final_ids = (prefix_ids_trimmed + resp_ids)[:seq_length]
-    n_resp = min(len(resp_ids), len(final_ids))
-    n_prefix = len(final_ids) - n_resp
+    if len(resp_ids) < min_response_tokens:
+        return None
+
+    final_ids = prefix_ids + resp_ids
+    n_prefix = prefix_len
+    n_resp = len(resp_ids)
 
     loss_mask = [0] * n_prefix + [1] * n_resp
     assert len(loss_mask) == len(final_ids)
