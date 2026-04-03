@@ -7,14 +7,14 @@ Differences from gen_apilog_dataset.py:
   - Does NOT extract hidden states (dynamic training does that on-the-fly)
   - Outputs HF dataset directly (no .pt files)
   - Supports streaming directly from tar.gz (no extraction needed)
+  - Scans the ENTIRE CSV; tokenizes all valid rows then splits train/val
 
 Usage (inside pod on youyun.37):
-    python3 /tmp/gen_hf_dataset_from_csv.py \\
-        --tar-path /data/datasets/export-3c6b3075-afb1-44c8-a803-da5b1fe72734_1775096260.tar.gz \\
+    python3 scripts/gen_hf_dataset_from_csv.py \\
+        --tar-path /data/datasets/export-3c6b3075-....tar.gz \\
         --model-path /data/models/Kimi-K2.5 \\
-        --output /data/datasets/export_3c6b3075_hf \\
-        --train-size 30000 --val-size 3000 \\
-        --seq-length 4096
+        --output /data/datasets/export_3c6b3075_16k_hf \\
+        --seq-length 16384
 """
 
 import argparse
@@ -44,7 +44,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Helpers from gen_apilog_dataset.py
+# Helpers
 # ---------------------------------------------------------------------------
 
 class NullStrippingWrapper(io.TextIOBase):
@@ -65,7 +65,6 @@ def _open_csv_stream(path: str):
     if path.endswith('.tar.gz') or path.endswith('.tgz'):
         log.info(f"Streaming first CSV file from tar.gz: {path}")
         tf = tarfile.open(path, 'r:gz')
-        # Find first .csv member
         for member in tf:
             if member.name.endswith('.csv') and member.isfile():
                 log.info(f"  Found CSV: {member.name} (size ~{member.size / 1e9:.1f} GB uncompressed)")
@@ -111,18 +110,15 @@ def load_rows_with_response(path: str, max_scan: int = 0) -> list:
                 log.info(f"  Reached max_scan={max_scan:,}, stopping.")
                 break
 
-            # Filter by request type
             if row.get('request_type', '').strip() != 'ChatCompletionStream':
                 skipped_type += 1
                 continue
 
-            # Only rows with existing response (skip generation entirely)
             response = (row.get('output_tokens', '') or '').strip()
             if not response:
                 skipped_no_resp += 1
                 continue
 
-            # Parse request_body JSON
             raw_body = row.get('request_body', '')
             if not raw_body:
                 skipped_parse += 1
@@ -143,10 +139,9 @@ def load_rows_with_response(path: str, max_scan: int = 0) -> list:
         if tf is not None:
             tf.close()
 
-    with_resp = len(rows)
     log.info(
         f"CSV scan complete: {total:,} total rows\n"
-        f"  Kept (with response): {with_resp:,}\n"
+        f"  Kept (with response): {len(rows):,}\n"
         f"  Skipped (wrong type): {skipped_type:,}\n"
         f"  Skipped (no response): {skipped_no_resp:,}\n"
         f"  Skipped (parse error): {skipped_parse:,}"
@@ -179,10 +174,7 @@ def _fast_tokenize_row(tokenizer, row: dict, seq_length: int, min_response_token
         if isinstance(c, list):
             return None
 
-    # Full conversation: all original messages + the response as final assistant turn
     full_conv = list(messages) + [{"role": "assistant", "content": response}]
-
-    # Prefix = all messages (without the final assistant response)
     prefix = list(messages)
     if not prefix:
         return None
@@ -200,30 +192,23 @@ def _fast_tokenize_row(tokenizer, row: dict, seq_length: int, min_response_token
     if not full_ids or len(full_ids) < 5:
         return None
 
-    # Derive response tokens = full_ids tokens after the prefix
     prefix_len = len(prefix_ids)
     resp_ids = full_ids[prefix_len:]
 
     if len(resp_ids) < min_response_tokens:
-        return None  # Response too short (probably truncated or empty)
+        return None
 
-    # Apply left-truncation if total exceeds seq_length:
-    # keep up to (seq_length - len(resp_ids)) prefix tokens from the RIGHT (most recent context)
+    # Left-truncation: keep rightmost prefix tokens + full response
     max_prefix = seq_length - len(resp_ids)
     if max_prefix <= 0:
-        # Response alone exceeds seq_length — truncate response
-        resp_ids = resp_ids[:seq_length - 16]  # keep at least 16 prefix tokens
+        resp_ids = resp_ids[:seq_length - 16]
         max_prefix = 16
     if prefix_len > max_prefix:
         prefix_ids_trimmed = prefix_ids[-max_prefix:]
     else:
         prefix_ids_trimmed = prefix_ids
 
-    final_ids = prefix_ids_trimmed + resp_ids
-    final_ids = final_ids[:seq_length]
-    actual_prefix_len = len(final_ids) - len(resp_ids[:seq_length - len(prefix_ids_trimmed)])
-
-    # Simpler: just compute actual prefix length in final_ids
+    final_ids = (prefix_ids_trimmed + resp_ids)[:seq_length]
     n_resp = min(len(resp_ids), len(final_ids))
     n_prefix = len(final_ids) - n_resp
 
@@ -247,7 +232,10 @@ def build_samples(rows: list, tokenizer, seq_length: int) -> list:
             elapsed = time.time() - t0
             rate = i / elapsed
             eta = (len(rows) - i) / rate if rate > 0 else 0
-            log.info(f"  {i:,}/{len(rows):,} tokenized ({rate:.0f}/s, ETA {eta/60:.1f}m) — valid={len(valid):,}")
+            log.info(
+                f"  {i:,}/{len(rows):,} tokenized ({rate:.0f}/s, ETA {eta/60:.1f}m) "
+                f"— valid={len(valid):,}"
+            )
         result = _fast_tokenize_row(tokenizer, row, seq_length)
         if result is None:
             skipped += 1
@@ -261,28 +249,32 @@ def build_samples(rows: list, tokenizer, seq_length: int) -> list:
     return valid
 
 
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--tar-path",    required=True,  help="Path to .tar.gz or .csv")
-    p.add_argument("--model-path",  required=True,  help="K2.5 local model path")
-    p.add_argument("--output",      required=True,  help="HF dataset output dir (contains /train and /val)")
-    p.add_argument("--val-ratio",   type=float, default=0.1,
-                   help="Fraction of valid samples for val (default: 0.1)")
-    p.add_argument("--seq-length",  type=int, default=16384,
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--tar-path",   required=True, help="Path to .tar.gz or .csv")
+    p.add_argument("--model-path", required=True, help="K2.5 local model path")
+    p.add_argument("--output",     required=True, help="HF dataset output dir (contains /train and /val)")
+    p.add_argument("--val-ratio",  type=float, default=0.1,
+                   help="Fraction of valid samples reserved for val (default: 0.1)")
+    p.add_argument("--seq-length", type=int, default=16384,
                    help="Max sequence length; left-truncation keeps response (default: 16384)")
-    p.add_argument("--max-scan",    type=int, default=0, help="Max rows to scan (0=scan entire file)")
-    p.add_argument("--seed",        type=int, default=42)
+    p.add_argument("--max-scan",   type=int, default=0,
+                   help="Max rows to scan (0 = scan entire file)")
+    p.add_argument("--seed",       type=int, default=42)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
+    max_scan_str = "unlimited" if args.max_scan == 0 else f"{args.max_scan:,} rows"
     log.info("=" * 60)
     log.info("K2.5 API Log CSV -> HF Dataset (for dynamic training)")
     log.info("=" * 60)
@@ -290,11 +282,10 @@ def main():
     log.info(f"  Output:     {args.output}")
     log.info(f"  Seq length: {args.seq_length}")
     log.info(f"  Val ratio:  {args.val_ratio}")
-    log.info(f"  Max scan:   {'unlimited' if args.max_scan == 0 else str(args.max_scan) + ' rows'}")
+    log.info(f"  Max scan:   {max_scan_str}")
 
     # Phase 1: Scan entire CSV, collect all rows with response
-    log.info("
-[Phase 1] Scanning full CSV for all rows with response...")
+    log.info("\n[Phase 1] Scanning full CSV for all rows with response...")
     rows = load_rows_with_response(args.tar_path, max_scan=args.max_scan)
 
     if not rows:
@@ -302,16 +293,14 @@ def main():
         return
 
     # Phase 2: Load tokenizer
-    log.info(f"
-[Phase 2] Loading tokenizer from {args.model_path}...")
+    log.info(f"\n[Phase 2] Loading tokenizer from {args.model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     log.info(f"  Vocab size: {tokenizer.vocab_size:,}")
 
     # Phase 3: Tokenize ALL rows, collect valid samples
-    log.info(f"
-[Phase 3] Tokenizing all {len(rows):,} rows (seq_length={args.seq_length})...")
+    log.info(f"\n[Phase 3] Tokenizing all {len(rows):,} rows (seq_length={args.seq_length})...")
     all_samples = build_samples(rows, tokenizer, args.seq_length)
 
     if not all_samples:
@@ -319,22 +308,19 @@ def main():
         return
 
     # Phase 4: Shuffle and split into train/val
-    log.info(f"
-[Phase 4] Splitting {len(all_samples):,} valid samples (val_ratio={args.val_ratio})...")
+    log.info(f"\n[Phase 4] Splitting {len(all_samples):,} valid samples (val_ratio={args.val_ratio})...")
     rng = random.Random(args.seed)
     rng.shuffle(all_samples)
-    n_val   = max(1, int(len(all_samples) * args.val_ratio))
+    n_val = max(1, int(len(all_samples) * args.val_ratio))
     n_train = len(all_samples) - n_val
     train_samples = all_samples[:n_train]
     val_samples   = all_samples[n_train:]
     log.info(f"  Train: {len(train_samples):,}, Val: {len(val_samples):,}")
 
     # Phase 5: Save HF datasets
-    log.info("
-[Phase 5] Saving HF datasets...")
+    log.info("\n[Phase 5] Saving HF datasets...")
     train_out = os.path.join(args.output, "train")
     val_out   = os.path.join(args.output, "val")
-    from pathlib import Path
     Path(train_out).mkdir(parents=True, exist_ok=True)
     Path(val_out).mkdir(parents=True, exist_ok=True)
 
@@ -344,8 +330,8 @@ def main():
             return 0
         input_ids  = [s[0] for s in samples]
         loss_masks = [s[1] for s in samples]
-        lengths    = [len(ids) for ids in input_ids]
-        trainable  = [sum(m) for m in loss_masks]
+        lengths   = [len(ids) for ids in input_ids]
+        trainable = [sum(m) for m in loss_masks]
         log.info(
             f"  {name}: {len(samples):,} samples, "
             f"avg_len={sum(lengths)/len(lengths):.0f}, "
@@ -360,12 +346,11 @@ def main():
     n_train_saved = save_hf(train_samples, train_out, "train")
     n_val_saved   = save_hf(val_samples,   val_out,   "val")
 
-    log.info("
-" + "=" * 60)
+    log.info("\n" + "=" * 60)
     log.info("DONE")
     log.info(f"  Train: {n_train_saved:,} samples -> {train_out}")
     log.info(f"  Val:   {n_val_saved:,} samples -> {val_out}")
-    log.info(f"  Total disk: run 'du -sh {args.output}'")
+    log.info(f"  Run 'du -sh {args.output}' to check disk usage")
     log.info("=" * 60)
 
 
