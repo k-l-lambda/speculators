@@ -2,13 +2,14 @@
 """Extract INT4 hidden states using VllmHiddenStatesGenerator as __main__.
 
 Key: Do NOT import torch before vLLM to avoid CUDA fork issue.
-Run as: python3 extract_int4_vllm_main.py (standalone, not imported)
+Run as: python3 extract_int4_hidden_states.py (standalone, not imported)
 """
+import argparse
 import os
 import sys
-import argparse
 
 # CRITICAL: Do NOT import torch here. Let vLLM initialize CUDA first.
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -18,21 +19,26 @@ def parse_args():
     parser.add_argument("--layer-ids", type=int, nargs="+", default=[2, 30, 58, 60])
     parser.add_argument("--tensor-parallel-size", type=int, default=8)
     parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-samples", type=int, default=None)
     return parser.parse_args()
 
 
+def trim_loss_mask(loss_mask, effective_len):
+    if loss_mask is None:
+        return None
+    return loss_mask[:effective_len].clone()
+
+
 def main():
     args = parse_args()
 
-    # Import torch AFTER parsing args (before vLLM is fine if we don't touch CUDA)
     import torch
     from pathlib import Path
     from tqdm import tqdm
 
-    # Now import vLLM - it will initialize CUDA via multiprocessing spawn
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
     from speculators.data_generation.vllm_hidden_states_generator import VllmHiddenStatesGenerator
 
     data_dir = Path(args.data_dir)
@@ -50,7 +56,7 @@ def main():
         layer_ids=args.layer_ids,
         max_model_len=args.max_model_len,
         tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
     print("Generator ready", flush=True)
 
@@ -60,19 +66,29 @@ def main():
         batch_files = pt_files[batch_start:batch_start + args.batch_size]
 
         batch_data = []
-# Skip files already processed        batch_files_filtered = []        for pt_file in batch_files:            out_path = output_dir / pt_file.name            if out_path.exists():                processed += 1                continue            batch_files_filtered.append(pt_file)        batch_files = batch_files_filtered
+        batch_files_filtered = []
+        for pt_file in batch_files:
+            out_path = output_dir / pt_file.name
+            if out_path.exists():
+                processed += 1
+                continue
+            batch_files_filtered.append(pt_file)
+        batch_files = batch_files_filtered
+
         for pt_file in batch_files:
             sample = torch.load(str(pt_file), map_location="cpu", weights_only=True)
             input_ids = sample["input_ids"]
             if len(input_ids) < 3:
                 skipped += 1
                 continue
-            input_ids = input_ids[:args.max_model_len - 1]
-            batch_data.append({
-                "file": pt_file,
-                "input_ids": input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids,
-                "loss_mask": sample.get("loss_mask"),
-            })
+            input_ids = input_ids[: args.max_model_len - 1]
+            batch_data.append(
+                {
+                    "file": pt_file,
+                    "input_ids": input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids,
+                    "loss_mask": sample.get("loss_mask"),
+                }
+            )
 
         if not batch_data:
             continue
@@ -84,23 +100,26 @@ def main():
             print(f"Batch {batch_start} failed: {e}", flush=True)
             continue
 
-        # Generator sorts results by str(idx), not insertion order
         sorted_idx = sorted(range(len(batch_data)), key=lambda i: str(i))
         reordered = [None] * len(batch_data)
         for k, orig in enumerate(sorted_idx):
             reordered[orig] = results[k]
+
         for data, result in zip(batch_data, reordered):
             out_path = output_dir / data["file"].name
-            torch.save({
-                "input_ids": result["input_ids"],
-                "hidden_states": result["hidden_states"],
-                "loss_mask": data["loss_mask"],
-            }, str(out_path))
+            effective_len = len(result["input_ids"])
+            torch.save(
+                {
+                    "input_ids": result["input_ids"],
+                    "hidden_states": result["hidden_states"],
+                    "loss_mask": trim_loss_mask(data["loss_mask"], effective_len),
+                },
+                str(out_path),
+            )
             processed += 1
 
     print(f"Done: processed={processed}, skipped={skipped}", flush=True)
     print(f"Output: {output_dir}", flush=True)
-    # generator.shutdown()  # Not implemented
 
 
 if __name__ == "__main__":
