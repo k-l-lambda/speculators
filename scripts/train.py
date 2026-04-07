@@ -243,6 +243,7 @@ def main(args: argparse.Namespace):
         local_rank=local_rank,
         train_call_kwargs=train_call_kwargs,
         val_call_kwargs=val_call_kwargs,
+        max_checkpoints=args.max_checkpoints,
         scheduler_type=args.scheduler_type,
         scheduler_warmup_steps=args.scheduler_warmup_steps,
         scheduler_total_steps=args.scheduler_total_steps,
@@ -289,6 +290,15 @@ def main(args: argparse.Namespace):
                 seed=args.seed,
             )
             _dyn_log.info("Dataset: %d samples", len(hf_dataset))
+
+        # Apply max-samples cap (subsample for manageable epoch length)
+        if args.max_samples > 0 and len(hf_dataset) > args.max_samples:
+            import random as _rng
+            _rng.seed(args.seed)
+            indices = _rng.sample(range(len(hf_dataset)), args.max_samples)
+            indices.sort()
+            hf_dataset = hf_dataset.select(indices)
+            _dyn_log.info("Subsampled to %d samples (--max-samples %d)", len(hf_dataset), args.max_samples)
 
         # 2. Split into train/val
         n_val = int(len(hf_dataset) * args.val_ratio)
@@ -368,6 +378,7 @@ def main(args: argparse.Namespace):
             noise_transform=noise_transform,
             standardize_fn=standardize_fn,
             max_len=args.total_seq_len,
+            epoch_samples=args.epoch_samples,
         )
     else:
         # ---- Offline training (existing path) ----
@@ -410,6 +421,8 @@ def parse_args():
     )
     parser.add_argument("--data-path", type=str, default="./data")
     parser.add_argument("--save-path", type=str, default="./checkpoints")
+    parser.add_argument("--max-checkpoints", type=int, default=None,
+                        help="Keep only the N most recent checkpoints; delete older ones. Default: keep all.")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--no-resume-from-checkpoint", action="store_true")
@@ -524,6 +537,14 @@ def parse_args():
     parser.add_argument(
         "--val-ratio", type=float, default=0.1,
         help="[dynamic] Fraction of dataset to use for validation (default: 0.1)",
+    )
+    parser.add_argument(
+        "--max-samples", type=int, default=0,
+        help="[dynamic] Max training+val samples to use (0=all). Useful to cap epoch length.",
+    )
+    parser.add_argument(
+        "--epoch-samples", type=int, default=0,
+        help="[dynamic] Max training samples per epoch (0=full dataset). Cycles through all data.",
     )
     parser.add_argument(
         "--enforce-eager", action="store_true", default=False,

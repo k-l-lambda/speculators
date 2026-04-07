@@ -33,8 +33,9 @@ class BaseCheckpointer:
         ...
     """
 
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, max_checkpoints: int | None = None):
         self.path = Path(path)
+        self.max_checkpoints = max_checkpoints
         self.previous_epoch = self._get_previous_epoch()
 
         if self.previous_epoch != -1:
@@ -81,6 +82,21 @@ class BaseCheckpointer:
         float_dtype: torch.dtype = torch.bfloat16,
     ):
         raise NotImplementedError
+
+    def _prune_old_checkpoints(self, current_epoch: int) -> None:
+        """Delete checkpoint dirs older than (current_epoch - max_checkpoints + 1)."""
+        if self.max_checkpoints is None or self.max_checkpoints <= 0:
+            return
+        cutoff = current_epoch - self.max_checkpoints  # keep epochs > cutoff
+        for d in sorted(self.path.iterdir()):
+            if d.is_dir():
+                try:
+                    epoch_num = int(d.name)
+                except ValueError:
+                    continue
+                if epoch_num <= cutoff:
+                    import shutil
+                    shutil.rmtree(d)
 
     def _get_previous_epoch(self) -> int:
         if not self.path.exists():
@@ -190,6 +206,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         model.save_pretrained(self.path / str(epoch), state_dict=model_state_dict)
         optimizer_state_dict = convert_float_dtype(optimizer.state_dict(), float_dtype)
         torch.save(optimizer_state_dict, self.optimizer_path(epoch))
+        self._prune_old_checkpoints(epoch)
 
 
 class DistributedCheckpointer(BaseCheckpointer):
@@ -266,5 +283,6 @@ class DistributedCheckpointer(BaseCheckpointer):
             # Only rank 0 saves the checkpoint
             model.save_pretrained(self.path / str(epoch), state_dict=model_state_dict)
             torch.save(optimizer_state_dict, self.optimizer_path(epoch))
+            self._prune_old_checkpoints(epoch)
 
         dist.barrier()

@@ -40,6 +40,7 @@ class TrainerConfig(NamedTuple):
     scheduler_warmup_steps: int | None = None
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
+    max_checkpoints: int | None = None
 
 
 class Trainer:
@@ -60,7 +61,9 @@ class Trainer:
         checkpointer_class = (
             DistributedCheckpointer if self.is_distributed else SingleGPUCheckpointer
         )
-        self.checkpointer: BaseCheckpointer = checkpointer_class(self.config.save_path)
+        self.checkpointer: BaseCheckpointer = checkpointer_class(
+            self.config.save_path, max_checkpoints=self.config.max_checkpoints
+        )
 
         self.setup_trainer()
         self.setup_model()
