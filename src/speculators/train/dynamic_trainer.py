@@ -177,6 +177,7 @@ class DynamicTrainer(Trainer):
         standardize_fn: StandardizeFnSig = standardize_data_v1,
         max_len: int = 8192,
         hidden_states_dtype: torch.dtype = torch.float,
+        epoch_samples: int = 0,
     ):
         assert not config.is_distributed, (
             "DynamicTrainer only supports single-GPU training "
@@ -188,6 +189,10 @@ class DynamicTrainer(Trainer):
         self.max_len = max_len
         self.hidden_states_dtype = hidden_states_dtype
         self._collate_fn = create_collate_fn(max_len)
+        self._epoch_samples = epoch_samples
+        self._val_epoch_samples = val_epoch_samples
+        self._global_train_iter = None
+        self._full_passes = 0
         super().__init__(model, config, train_loader, val_loader)
 
     def setup_model(self):
@@ -294,6 +299,10 @@ class DynamicTrainer(Trainer):
     def train_epoch(self, epoch: int):
         self.model.train()
 
+        if self._epoch_samples > 0:
+            self._run_chunked_epoch(epoch)
+            return
+
         # Create prefetcher with noise enabled
         prefetcher = DynamicBatchPrefetcher(
             dataloader=self.train_loader,
@@ -341,6 +350,70 @@ class DynamicTrainer(Trainer):
         finally:
             prefetcher.stop()
 
+    def _run_chunked_epoch(self, epoch: int) -> None:
+        """Epoch-chunked: consume epoch_samples training samples from persistent iterator."""
+        if self._global_train_iter is None:
+            if hasattr(self.train_loader.batch_sampler, "set_epoch"):
+                self.train_loader.batch_sampler.set_epoch(self._full_passes)
+            self._global_train_iter = iter(self.train_loader)
+            root_logger.info("[chunked] Starting full-dataset pass #1")
+
+        samples_done = 0
+        batches_done = 0
+
+        while samples_done < self._epoch_samples:
+            try:
+                lbatch = next(self._global_train_iter)
+            except StopIteration:
+                self._full_passes += 1
+                root_logger.info(
+                    "[chunked] Pass %d complete (epoch %d, %d samples so far). Restarting.",
+                    self._full_passes, epoch, samples_done)
+                if hasattr(self.train_loader.batch_sampler, "set_epoch"):
+                    self.train_loader.batch_sampler.set_epoch(self._full_passes)
+                self._global_train_iter = iter(self.train_loader)
+                lbatch = next(self._global_train_iter)
+
+            try:
+                gpu_batch = self._generate_batch(lbatch, apply_noise=True)
+            except Exception as exc:
+                root_logger.warning("Chunked batch gen failed: %s, skipping", exc)
+                continue
+
+            gpu_batch = {
+                k: v.to(self.local_rank, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in gpu_batch.items()
+            }
+            _draft_tokens, loss, metrics = self.model(**gpu_batch, **self.config.train_call_kwargs)
+            self.opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.opt.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            current_lr = self.opt.param_groups[0]["lr"]
+            metrics = {k: v.item() for k, v in metrics.items()}
+            metric_logger.info(
+                {"train": metrics, "epoch": epoch, "lr": current_lr},
+                extra={"step": self.global_step},
+            )
+            self.global_step += 1
+
+            n = lbatch["lengths"].shape[0]
+            samples_done += n
+            batches_done += 1
+            if batches_done % 500 == 0:
+                pct = 100.0 * samples_done / self._epoch_samples
+                root_logger.info(
+                    "[chunked] Epoch %d: %d/%d samples (%.1f%%), pass #%d, lr=%.2e",
+                    epoch, samples_done, self._epoch_samples, pct,
+                    self._full_passes + 1, current_lr)
+
+        root_logger.info(
+            "[chunked] Epoch %d done: %d samples, %d batches, pass #%d",
+            epoch, samples_done, batches_done, self._full_passes + 1)
+
     @torch.no_grad()
     def val_epoch(self, epoch: int):
         if self.val_loader is None:
@@ -357,6 +430,7 @@ class DynamicTrainer(Trainer):
 
         val_metrics: dict[str, float] = {}
         num_batches = 0
+        val_samples_done = 0
 
         for batch in val_loader:
             try:
@@ -379,6 +453,9 @@ class DynamicTrainer(Trainer):
             for k, v in metrics.items():
                 val_metrics[k] = val_metrics.get(k, 0.0) + v.item()
             num_batches += 1
+            val_samples_done += batch["lengths"].shape[0] if "lengths" in batch else 1
+            if self._val_epoch_samples > 0 and val_samples_done >= self._val_epoch_samples:
+                break
 
         if num_batches > 0:
             val_metrics = {

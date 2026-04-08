@@ -379,6 +379,7 @@ def main(args: argparse.Namespace):
             standardize_fn=standardize_fn,
             max_len=args.total_seq_len,
             epoch_samples=args.epoch_samples,
+            val_epoch_samples=args.val_epoch_samples,
         )
     else:
         # ---- Offline training (existing path) ----
