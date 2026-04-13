@@ -495,7 +495,15 @@ class Eagle3DraftModel(SpeculatorModel):
             metrics = {}
 
         draft_tokens = []
+        # Track whether we use dense 4D mask (sdpa) or BlockMask (flex_attention)
+        _use_dense_mask = isinstance(attention_mask, torch.Tensor)
+
         for ttt_step in range(ttt_steps):
+            # For dense 4D mask (sdpa), each TTT step is an independent forward pass
+            # (no cross-step KV accumulation; KV size must stay == mask KV size)
+            if _use_dense_mask and ttt_step > 0:
+                past_key_values = DynamicCache(config=self.config.transformer_layer_config)
+
             with torch.no_grad():
                 input_embeds = self.embed_tokens(input_ids)
                 # shape: [1, total_seq_len, hidden_size]
