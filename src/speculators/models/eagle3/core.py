@@ -139,22 +139,40 @@ def loss_function(
     logits: torch.Tensor,  # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
     targets: torch.Tensor,  # shape: [1, total_seq_len - ttt_step, draft_vocab_size]
     loss_mask: torch.Tensor | None,  # shape: [1, total_seq_len - ttt_step]
+    loss_type: str = "kl",
 ):
     # Note: logits, targets, and loss_mask are already aligned for the current ttt_step
-    logits = torch.nn.functional.log_softmax(logits, dim=-1)
-    target_p = torch.nn.functional.softmax(targets, dim=-1)
-    elementwise_loss = torch.nn.functional.kl_div(
-        logits, target_p, reduction="none", log_target=False
-    )
-
-    if loss_mask is not None:
-        elementwise_loss = elementwise_loss * loss_mask.unsqueeze(-1)
-        denominator: torch.Tensor | int = loss_mask.sum(dim=1) + 1e-5
+    if loss_type == "ce":
+        # CE against argmax of target distribution -- avoids [1, seq_len, vocab] intermediate
+        target_ids = torch.argmax(targets, dim=-1)  # [1, seq_len]
+        batch, seq_len, vocab_size = logits.shape
+        flat_logits = logits.reshape(batch * seq_len, vocab_size)
+        flat_targets = target_ids.reshape(batch * seq_len)
+        elementwise_loss = torch.nn.functional.cross_entropy(
+            flat_logits, flat_targets, reduction="none"
+        ).reshape(batch, seq_len)  # [1, seq_len]
+        if loss_mask is not None:
+            elementwise_loss = elementwise_loss * loss_mask
+            denominator: torch.Tensor | int = loss_mask.sum(dim=1) + 1e-5
+        else:
+            denominator = seq_len
+        batch_loss = elementwise_loss.sum(dim=1) / denominator
+        return batch_loss.mean()
     else:
-        denominator = logits.shape[1]  # total_seq_len - ttt_step
-    batch_loss = torch.sum(elementwise_loss, dim=(1, 2)) / denominator
-    # shape: [1]
-    return batch_loss.mean()
+        # KL divergence (default)
+        logits = torch.nn.functional.log_softmax(logits, dim=-1)
+        target_p = torch.nn.functional.softmax(targets, dim=-1)
+        elementwise_loss = torch.nn.functional.kl_div(
+            logits, target_p, reduction="none", log_target=False
+        )
+        if loss_mask is not None:
+            elementwise_loss = elementwise_loss * loss_mask.unsqueeze(-1)
+            denominator = loss_mask.sum(dim=1) + 1e-5
+        else:
+            denominator = logits.shape[1]  # total_seq_len - ttt_step
+        batch_loss = torch.sum(elementwise_loss, dim=(1, 2)) / denominator
+        # shape: [1]
+        return batch_loss.mean()
 
 
 def compute_metrics(
@@ -164,6 +182,7 @@ def compute_metrics(
     prev_correct: torch.Tensor | None,
     ttt_step: int,
     ttt_step_loss_decay: float,
+    loss_type: str = "kl",
 ) -> tuple[torch.Tensor, dict]:
     """Compute metrics for a given ttt_step.
 
@@ -187,7 +206,7 @@ def compute_metrics(
         logits, targets, loss_mask, prev_correct, ttt_step
     )
     loss_weight = ttt_step_loss_decay**ttt_step
-    s_loss = loss_weight * loss_function(s_logits, s_targets, s_loss_mask)
+    s_loss = loss_weight * loss_function(s_logits, s_targets, s_loss_mask, loss_type=loss_type)
 
     s_full_acc, s_cond_acc = compute_accuracy(
         s_logits, s_targets, s_loss_mask, s_prev_correct
@@ -416,6 +435,7 @@ class Eagle3DraftModel(SpeculatorModel):
         ttt_steps: int = 3,
         ttt_step_loss_decay: float = 1.0,
         use_off_policy_tokens: bool = False,
+        loss_type: str = "kl",
         **kwargs,
     ):
         device = hidden_states.device
@@ -434,7 +454,8 @@ class Eagle3DraftModel(SpeculatorModel):
         # Build attention mask: dense 4D for models without flex_attention (K2.5),
         # BlockMask for models that support it (Llama, Qwen3)
         model_type = self.config.transformer_layer_config.model_type
-        if model_type in _DENSE_MASK_MODEL_TYPES:
+        attn_impl = getattr(self.config.transformer_layer_config, "_attn_implementation", "simple_flex_attention")
+        if model_type in _DENSE_MASK_MODEL_TYPES or attn_impl in ("sdpa", "eager"):
             attention_mask = build_packed_attention_mask(
                 lengths, total_seq_len, hidden_states.dtype, device
             )
@@ -513,6 +534,7 @@ class Eagle3DraftModel(SpeculatorModel):
                     prev_correct,
                     ttt_step,
                     ttt_step_loss_decay,
+                    loss_type=loss_type,
                 )
                 loss += s_loss
                 metrics.update(s_metrics)
@@ -609,10 +631,12 @@ class Eagle3DraftModel(SpeculatorModel):
             "use_off_policy_tokens": kwargs["use_off_policy_tokens"],
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
+            "loss_type": kwargs.get("loss_type", "kl"),
         }
         val_kwargs = {
             "use_off_policy_tokens": False,
             "ttt_steps": kwargs["ttt_steps"],
             "ttt_step_loss_decay": kwargs["ttt_step_loss_decay"],
+            "loss_type": kwargs.get("loss_type", "kl"),
         }
         return train_kwargs, val_kwargs

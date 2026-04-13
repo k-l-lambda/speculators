@@ -112,10 +112,7 @@ def create_transformer_layer_config(
     if draft_config_path is not None:
         config = AutoConfig.from_pretrained(draft_config_path, trust_remote_code=True)
         config.num_hidden_layers = num_layers
-        if getattr(config, "model_type", None) == "kimi_k2":
-            config._attn_implementation = "sdpa"
-        else:
-            config._attn_implementation = "simple_flex_attention"
+        config._attn_implementation = "sdpa"  # avoid flex_attention OOM in training
         return config
 
     if draft_arch not in DRAFT_ARCH_CONFIGS:
