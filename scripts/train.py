@@ -106,8 +106,18 @@ def setup_dataloader(
 
 
 def create_transformer_layer_config(
-    verifier_name_or_path: str, num_layers: int, draft_arch: str = "llama"
+    verifier_name_or_path: str, num_layers: int, draft_arch: str = "llama",
+    draft_config_path: str = None,
 ) -> PretrainedConfig:
+    if draft_config_path is not None:
+        config = AutoConfig.from_pretrained(draft_config_path, trust_remote_code=True)
+        config.num_hidden_layers = num_layers
+        if getattr(config, "model_type", None) == "kimi_k2":
+            config._attn_implementation = "sdpa"
+        else:
+            config._attn_implementation = "simple_flex_attention"
+        return config
+
     if draft_arch not in DRAFT_ARCH_CONFIGS:
         raise ValueError(
             f"Unknown draft architecture: {draft_arch}. "
@@ -200,7 +210,8 @@ def main(args: argparse.Namespace):
 
     # Setup speculator config
     transformer_layer_config = create_transformer_layer_config(
-        args.verifier_name_or_path, args.num_layers, draft_arch=args.draft_arch
+        args.verifier_name_or_path, args.num_layers, draft_arch=args.draft_arch,
+        draft_config_path=args.draft_config,
     )
 
     # Get model class from registry and create model using its factory method
@@ -445,6 +456,14 @@ def parse_args():
         help="Architecture for draft decoder layers. Defaults to 'llama'. "
         "Note: only 'llama' is currently supported in vLLM for inference.",
     )
+    parser.add_argument(
+        "--draft-config",
+        type=str,
+        default=None,
+        help="Path to a HuggingFace config dir for the draft model, bypassing config "
+        "derivation from the verifier. Enables loading architectures like lightseekorg "
+        "GQA directly (e.g. --draft-config /data/models/lightseekorg-eagle3/)."
+    )
     parser.add_argument("--d2t-path", type=str, default=None)
     parser.add_argument("--t2d-path", type=str, default=None)
     parser.add_argument("--ttt-steps", type=int, default=3)
@@ -546,6 +565,10 @@ def parse_args():
     parser.add_argument(
         "--epoch-samples", type=int, default=0,
         help="[dynamic] Max training samples per epoch (0=full dataset). Cycles through all data.",
+    )
+    parser.add_argument(
+        "--val-epoch-samples", type=int, default=0,
+        help="[dynamic] Max validation samples per epoch (0=full val set).",
     )
     parser.add_argument(
         "--enforce-eager", action="store_true", default=False,
