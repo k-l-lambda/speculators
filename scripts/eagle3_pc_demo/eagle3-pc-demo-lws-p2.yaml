@@ -1,0 +1,400 @@
+##
+# EAGLE3 Producer-Consumer POC — Phase 2
+# Real verifier: K2.5 (TP=8) on youyun.37; real Eagle3 head on host-10-83-115-14
+#
+# Producer (rank 0 / leader): host-10-83-115-10, 8 GPUs
+#   - Loads K2.5 via VllmHiddenStatesGenerator (TP=8)
+#   - Sends aux_hs [B=2,S=128,3H=21504] bf16 + last_hs [B=2,S=128,H=7168] bf16
+#   - Total ~14.7 MB/step
+#
+# Consumer (rank 1 / worker): host-10-83-115-14, 1 GPU
+#   - Eagle3HeadPOC: FC(3H→H) + LayerNorm + SiLU-MLP residual
+#   - MSE loss vs last_hs; backward + AdamW step
+#   - Sends loss scalar back to producer
+#
+# NCCL port separation:
+#   MASTER_PORT=29500 → P2P group (producer ↔ consumer)
+#   MASTER_PORT=29502 → vLLM TP group (K2.5 workers on youyun.37)
+#
+# Usage:
+#   scp eagle3-pc-demo-lws-p2.yaml youyun.37:/tmp/
+#   ssh youyun.37 "kubectl apply -f /tmp/eagle3-pc-demo-lws-p2.yaml"
+#
+# Monitor:
+#   kubectl logs -f eagle3-pc-demo-p2-0    # producer (leader)
+#   kubectl logs -f eagle3-pc-demo-p2-0-1  # consumer (worker)
+#
+# Cleanup:
+#   kubectl delete lws eagle3-pc-demo-p2
+#   kubectl delete configmap eagle3-pc-demo-p2-scripts
+##
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eagle3-pc-demo-p2-scripts
+  namespace: default
+data:
+  producer_p2.py: |
+    """
+    EAGLE3 Producer-Consumer Demo Phase 2 - Producer (youyun.37)
+    Loads K2.5 (TP=8) via VllmHiddenStatesGenerator.
+    Sends hidden states [B,S,3H]+[B,S,H] to consumer via NCCL P2P.
+    NCCL port separation: P2P=29500, vLLM-TP=29502
+    """
+    import os, sys, time, logging
+    import torch, torch.distributed as dist
+
+    logging.basicConfig(level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d [producer] %(message)s", datefmt="%H:%M:%S")
+    log = logging.getLogger(__name__)
+
+    MODEL_PATH = "/data/models/Kimi-K2.5"
+    LAYER_IDS  = [2, 30, 58, 60]
+    B, S       = 2, 128
+    NUM_STEPS  = 10
+    WARMUP     = 2
+    VLLM_PORT  = int(os.environ.get("VLLM_MASTER_PORT", "29502"))
+
+    def pack_hidden_states(results, device):
+        n_aux = len(LAYER_IDS) - 1
+        aux_list, last_list = [], []
+        for r in results:
+            hs = r["hidden_states"]
+            aux = torch.cat([hs[j] for j in range(n_aux)], dim=-1)
+            aux_list.append(aux.to(device=device, dtype=torch.bfloat16))
+            last_list.append(hs[n_aux].to(device=device, dtype=torch.bfloat16))
+        return torch.stack(aux_list), torch.stack(last_list)
+
+    def main():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+
+        log.info(f"Init P2P dist group rank=0 world=2 "
+                 f"{os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')}")
+        dist.init_process_group(backend="nccl")
+        assert dist.get_rank() == 0 and dist.get_world_size() == 2
+        log.info("P2P dist group initialized")
+
+        os.environ["MASTER_PORT"] = str(VLLM_PORT)
+        log.info(f"Redirected MASTER_PORT to {VLLM_PORT} for vLLM workers")
+
+        sys.path.insert(0, "/workspace/speculators/src")
+        from speculators.data_generation.vllm_hidden_states_generator import VllmHiddenStatesGenerator
+
+        log.info(f"Loading K2.5 TP=8 layers={LAYER_IDS} ...")
+        t_load = time.time()
+        generator = VllmHiddenStatesGenerator(
+            model_path=MODEL_PATH, layer_ids=LAYER_IDS,
+            max_model_len=512, gpu_memory_utilization=0.85,
+            tensor_parallel_size=8, enforce_eager=True,
+        )
+        log.info(f"K2.5 loaded in {time.time()-t_load:.1f}s")
+
+        H = 7168
+        aux_buf   = torch.empty(B, S, 3*H, dtype=torch.bfloat16, device=device)
+        last_buf  = torch.empty(B, S,   H, dtype=torch.bfloat16, device=device)
+        loss_recv = torch.zeros(1, dtype=torch.float32, device=device)
+        nb = aux_buf.nbytes + last_buf.nbytes
+        log.info(f"Transfer/step: {nb/1e6:.1f} MB  (aux={aux_buf.nbytes/1e6:.1f}MB last={last_buf.nbytes/1e6:.1f}MB)")
+
+        token_ids = [[i % 9000 + 1000 for i in range(S)] for _ in range(B)]
+        log.info(f"Starting loop: B={B} S={S} steps={NUM_STEPS}")
+
+        latencies = []
+        for step in range(NUM_STEPS):
+            t0 = time.perf_counter()
+            results = generator.generate(token_ids)
+            gen_t = time.perf_counter() - t0
+
+            aux_hs, last_hs = pack_hidden_states(results, device)
+            aux_buf[:] = aux_hs
+            last_buf[:] = last_hs
+
+            dist.send(aux_buf, dst=1)
+            dist.send(last_buf, dst=1)
+            send_t = time.perf_counter() - t0
+
+            dist.recv(loss_recv, src=1)
+            total_t = time.perf_counter() - t0
+
+            if step >= WARMUP:
+                latencies.append(total_t)
+            log.info(f"step {step:02d}: gen={gen_t*1000:.0f}ms send={send_t*1000:.1f}ms "
+                     f"total={total_t*1000:.0f}ms consumer_loss={loss_recv.item():.4f}")
+
+        if latencies:
+            avg = sum(latencies)/len(latencies)
+            log.info(f"\n=== PRODUCER SUMMARY ({len(latencies)} steps): avg={avg*1000:.0f}ms/step {nb/1e6:.1f}MB/step ===")
+
+        dist.destroy_process_group()
+        log.info("DONE")
+
+    if __name__ == "__main__":
+        main()
+
+  consumer_p2.py: |
+    """
+    EAGLE3 Producer-Consumer Demo Phase 2 - Consumer (host-10-83-115-14)
+    Receives hidden states from producer via NCCL P2P.
+    Eagle3HeadPOC: FC(3H->H) + LayerNorm + SiLU-MLP residual. MSE loss.
+    No speculators dependency.
+    """
+    import os, time, logging
+    import torch, torch.nn as nn, torch.nn.functional as F, torch.distributed as dist
+
+    logging.basicConfig(level=logging.INFO,
+        format="%(asctime)s.%(msecs)03d [consumer] %(message)s", datefmt="%H:%M:%S")
+    log = logging.getLogger(__name__)
+
+    H, N_AUX   = 7168, 3
+    B, S       = 2, 128
+    LR         = 1e-4
+    NUM_STEPS  = 10
+
+    class Eagle3HeadPOC(nn.Module):
+        def __init__(self, H=7168, n_aux=3):
+            super().__init__()
+            self.fc   = nn.Linear(n_aux*H, H, bias=False)
+            self.norm = nn.LayerNorm(H)
+            self.w1   = nn.Linear(H, H*2, bias=False)
+            self.w2   = nn.Linear(H*2, H, bias=False)
+            self.act  = nn.SiLU()
+        def forward(self, aux_hs):
+            x = self.fc(aux_hs)
+            x = self.norm(x.float()).bfloat16()
+            return x + self.w2(self.act(self.w1(x)))
+
+    def main():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+
+        log.info(f"Init P2P dist group rank=1 world=2 "
+                 f"{os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')}")
+        dist.init_process_group(backend="nccl")
+        assert dist.get_rank() == 1 and dist.get_world_size() == 2
+        log.info("P2P dist group initialized")
+
+        model = Eagle3HeadPOC(H=H, n_aux=N_AUX).to(device=device, dtype=torch.bfloat16)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+        n_params = sum(p.numel() for p in model.parameters())
+        log.info(f"Eagle3HeadPOC: {n_params:,} params  device={device}")
+
+        aux_buf   = torch.empty(B, S, N_AUX*H, dtype=torch.bfloat16, device=device)
+        last_buf  = torch.empty(B, S, H,       dtype=torch.bfloat16, device=device)
+        loss_send = torch.zeros(1, dtype=torch.float32, device=device)
+        nb = aux_buf.nbytes + last_buf.nbytes
+        log.info(f"Buffers: {nb/1e6:.1f} MB/step  Waiting for producer ...")
+
+        losses = []
+        for step in range(NUM_STEPS):
+            t0 = time.perf_counter()
+            dist.recv(aux_buf, src=0)
+            dist.recv(last_buf, src=0)
+            recv_t = time.perf_counter() - t0
+
+            optimizer.zero_grad()
+            draft_hs = model(aux_buf)
+            loss = F.mse_loss(draft_hs.float(), last_buf.float())
+            loss.backward()
+            optimizer.step()
+            train_t = time.perf_counter() - t0
+
+            loss_val = loss.item()
+            losses.append(loss_val)
+            loss_send[0] = loss_val
+            dist.send(loss_send, dst=0)
+            log.info(f"step {step:02d}: recv={recv_t*1000:.1f}ms train={train_t*1000:.1f}ms "
+                     f"bw={nb/recv_t/1e9:.2f}GB/s loss={loss_val:.4f}")
+
+        if losses:
+            log.info(f"\n=== CONSUMER SUMMARY ({NUM_STEPS} steps) ===")
+            log.info(f"  loss: {losses[0]:.4f} -> {losses[-1]:.4f} "
+                     f"({'decreasing' if losses[-1] < losses[0] else 'not decreasing'})")
+            log.info(f"  params: {n_params:,}")
+
+        dist.destroy_process_group()
+        log.info("DONE")
+
+    if __name__ == "__main__":
+        main()
+
+---
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: eagle3-pc-demo-p2
+  namespace: default
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: None
+    leaderTemplate:
+      metadata:
+        labels:
+          role: producer
+          app: eagle3-pc-demo-p2
+      spec:
+        nodeName: host-10-83-115-10
+        hostNetwork: true
+        containers:
+        - name: worker
+          image: docker.io/library/speculators:v0.17.0
+          imagePullPolicy: Never
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            set -e
+            echo "=== EAGLE3 PC Demo Phase 2 — PRODUCER ==="
+            echo "  hostname: $(hostname)"
+            echo "  LWS_WORKER_INDEX: ${LWS_WORKER_INDEX}"
+            echo "  MASTER_ADDR: ${MASTER_ADDR}  MASTER_PORT: ${MASTER_PORT}"
+            nvidia-smi -L
+            echo "=== installing speculators from source ==="
+            pip install -e /workspace/speculators[training] --quiet --no-build-isolation 2>&1 | tail -3
+            echo "=== launching torchrun ==="
+            torchrun \
+              --nnodes=2 \
+              --nproc_per_node=1 \
+              --node_rank=0 \
+              --master_addr=${MASTER_ADDR} \
+              --master_port=${MASTER_PORT} \
+              /scripts/producer_p2.py
+            echo "=== PRODUCER DONE ==="
+            tail -f /dev/null
+          env:
+          - name: MASTER_ADDR
+            value: "10.83.115.10"
+          - name: MASTER_PORT
+            value: "29500"
+          - name: VLLM_MASTER_PORT
+            value: "29502"
+          - name: NCCL_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: GLOO_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: NCCL_IB_DISABLE
+            value: "0"
+          - name: NCCL_IB_GID_INDEX
+            value: "3"
+          - name: NCCL_DEBUG
+            value: "INFO"
+          - name: NCCL_DEBUG_SUBSYS
+            value: "INIT,P2P"
+          - name: HF_HUB_OFFLINE
+            value: "1"
+          - name: TRANSFORMERS_OFFLINE
+            value: "1"
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+            requests:
+              nvidia.com/gpu: "8"
+          volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+          - name: speculators
+            mountPath: /workspace/speculators
+          - name: models
+            mountPath: /data/models
+            readOnly: true
+          - name: dshm
+            mountPath: /dev/shm
+          - name: infiniband
+            mountPath: /dev/infiniband
+        volumes:
+        - name: scripts
+          configMap:
+            name: eagle3-pc-demo-p2-scripts
+        - name: speculators
+          hostPath:
+            path: /root/work/speculators
+            type: Directory
+        - name: models
+          hostPath:
+            path: /data/models
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: Directory
+    workerTemplate:
+      metadata:
+        labels:
+          role: consumer
+          app: eagle3-pc-demo-p2
+      spec:
+        nodeName: host-10-83-115-14
+        hostNetwork: true
+        containers:
+        - name: worker
+          image: docker.io/library/speculators:v0.17.0
+          imagePullPolicy: Never
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            set -e
+            echo "=== EAGLE3 PC Demo Phase 2 — CONSUMER ==="
+            echo "  hostname: $(hostname)"
+            echo "  LWS_WORKER_INDEX: ${LWS_WORKER_INDEX}"
+            echo "  MASTER_ADDR: ${MASTER_ADDR}  MASTER_PORT: ${MASTER_PORT}"
+            nvidia-smi -L
+            echo "=== launching torchrun ==="
+            torchrun \
+              --nnodes=2 \
+              --nproc_per_node=1 \
+              --node_rank=1 \
+              --master_addr=${MASTER_ADDR} \
+              --master_port=${MASTER_PORT} \
+              /scripts/consumer_p2.py
+            echo "=== CONSUMER DONE ==="
+            tail -f /dev/null
+          env:
+          - name: MASTER_ADDR
+            value: "10.83.115.10"
+          - name: MASTER_PORT
+            value: "29500"
+          - name: NCCL_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: GLOO_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: NCCL_IB_DISABLE
+            value: "0"
+          - name: NCCL_IB_GID_INDEX
+            value: "3"
+          - name: NCCL_DEBUG
+            value: "INFO"
+          - name: NCCL_DEBUG_SUBSYS
+            value: "INIT,P2P"
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+          - name: dshm
+            mountPath: /dev/shm
+          - name: infiniband
+            mountPath: /dev/infiniband
+        volumes:
+        - name: scripts
+          configMap:
+            name: eagle3-pc-demo-p2-scripts
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: Directory
