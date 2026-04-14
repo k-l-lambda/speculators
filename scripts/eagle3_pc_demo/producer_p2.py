@@ -73,12 +73,22 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
 
     # 1. Init P2P dist group — uses MASTER_ADDR:MASTER_PORT from torchrun env
+    from datetime import timedelta
     master_addr = os.environ.get("MASTER_ADDR", "10.83.115.10")
     master_port = os.environ.get("MASTER_PORT", "29500")
     log.info(f"Init P2P dist group: rank=0 world_size=2 addr={master_addr}:{master_port}")
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
     assert dist.get_rank() == 0 and dist.get_world_size() == 2
     log.info("P2P dist group initialized")
+
+    # 1b. P2P warm-up: force NCCL 2-rank communicator creation NOW (before K2.5 loads).
+    #     Without this, the communicator is created lazily on the first dist.send(), which
+    #     requires rank 1 to be simultaneously available — but rank 1 may time out waiting
+    #     while rank 0 spends 10-20 min loading K2.5.
+    warmup = torch.zeros(1, dtype=torch.float32, device=device)
+    dist.send(warmup, dst=1)
+    dist.recv(warmup, src=1)
+    log.info("P2P NCCL communicator warm-up done")
 
     # 2. Redirect MASTER_PORT for vLLM workers (must do before VllmHiddenStatesGenerator)
     os.environ["MASTER_PORT"] = str(VLLM_PORT)

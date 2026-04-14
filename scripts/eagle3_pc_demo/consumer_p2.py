@@ -72,12 +72,21 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
 
     # 1. Init P2P dist group
+    from datetime import timedelta
     master_addr = os.environ.get("MASTER_ADDR", "10.83.115.10")
     master_port = os.environ.get("MASTER_PORT", "29500")
     log.info(f"Init P2P dist group: rank=1 world_size=2 addr={master_addr}:{master_port}")
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
     assert dist.get_rank() == 1 and dist.get_world_size() == 2
     log.info("P2P dist group initialized")
+
+    # 1b. P2P warm-up: force NCCL 2-rank communicator creation while both sides are alive.
+    #     Without this, lazy communicator setup on first dist.recv() can time out if
+    #     rank 0 (producer) is busy loading K2.5 and never triggers its side.
+    warmup = torch.zeros(1, dtype=torch.float32, device=device)
+    dist.recv(warmup, src=0)
+    dist.send(warmup, dst=0)
+    log.info("P2P NCCL communicator warm-up done — waiting for producer to load K2.5 ...")
 
     # 2. Init Eagle3 head + optimizer
     model = Eagle3HeadPOC(H=H, n_aux=N_AUX).to(device=device, dtype=torch.bfloat16)

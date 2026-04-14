@@ -72,11 +72,18 @@ data:
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
 
+        from datetime import timedelta
         log.info(f"Init P2P dist group rank=0 world=2 "
                  f"{os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')}")
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
         assert dist.get_rank() == 0 and dist.get_world_size() == 2
         log.info("P2P dist group initialized")
+
+        # Warm-up P2P to force NCCL communicator creation before K2.5 load
+        warmup = torch.zeros(1, dtype=torch.float32, device=device)
+        dist.send(warmup, dst=1)
+        dist.recv(warmup, src=1)
+        log.info("P2P NCCL warm-up done")
 
         os.environ["MASTER_PORT"] = str(VLLM_PORT)
         log.info(f"Redirected MASTER_PORT to {VLLM_PORT} for vLLM workers")
@@ -172,11 +179,18 @@ data:
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
 
+        from datetime import timedelta
         log.info(f"Init P2P dist group rank=1 world=2 "
                  f"{os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')}")
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
         assert dist.get_rank() == 1 and dist.get_world_size() == 2
         log.info("P2P dist group initialized")
+
+        # Warm-up P2P to force NCCL communicator creation before producer loads K2.5
+        warmup = torch.zeros(1, dtype=torch.float32, device=device)
+        dist.recv(warmup, src=0)
+        dist.send(warmup, dst=0)
+        log.info("P2P NCCL warm-up done — waiting for producer to load K2.5 ...")
 
         model = Eagle3HeadPOC(H=H, n_aux=N_AUX).to(device=device, dtype=torch.bfloat16)
         optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
