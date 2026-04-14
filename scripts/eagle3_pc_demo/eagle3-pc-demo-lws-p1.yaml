@@ -1,0 +1,267 @@
+##
+# EAGLE3 Producer-Consumer POC — Phase 1
+# Cross-node NCCL P2P hidden state transfer benchmark
+#
+# Topology:
+#   Leader  (rank 0 / producer): host-10-83-115-10 (youyun.37), 1 GPU
+#   Worker  (rank 1 / consumer): host-10-83-115-14,              1 GPU
+#
+# Tensors transferred per step (K2.5 dims, B=4 S=512):
+#   hidden_states [4,512,21504] bf16 = 88 MB
+#   topk_vals     [4,512,100]   bf16 = 0.4 MB
+#   topk_idx      [4,512,100]   i32  = 0.4 MB
+#   Total: ~89 MB/step
+#
+# Usage:
+#   scp eagle3-pc-demo-lws-p1.yaml youyun.37:/tmp/
+#   ssh youyun.37 "kubectl apply -f /tmp/eagle3-pc-demo-lws-p1.yaml"
+#
+# Monitor:
+#   kubectl logs -f eagle3-pc-demo-0    # producer (leader)
+#   kubectl logs -f eagle3-pc-demo-0-1  # consumer (worker)
+#
+# Cleanup:
+#   kubectl delete lws eagle3-pc-demo
+#   kubectl delete configmap eagle3-pc-demo-scripts
+##
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eagle3-pc-demo-scripts
+  namespace: default
+data:
+  demo_p1_transfer.py: |
+    import os, time, torch, torch.nn as nn, torch.distributed as dist
+
+    def main():
+        local_rank  = int(os.environ.get("LOCAL_RANK", 0))
+        rank        = int(os.environ.get("RANK", 0))
+        world_size  = int(os.environ.get("WORLD_SIZE", 2))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        print(f"[rank {rank}] init_process_group start  world_size={world_size}  device={device}", flush=True)
+        dist.init_process_group(backend="nccl")
+        print(f"[rank {rank}] init_process_group DONE", flush=True)
+
+        B, S, H, TOPK = 4, 512, 7168, 100
+        NUM_STEPS, WARMUP = 25, 5
+
+        hidden    = torch.randn(B, S, 3*H, dtype=torch.bfloat16, device=device)
+        topk_vals = torch.randn(B, S, TOPK, dtype=torch.bfloat16, device=device)
+        topk_idx  = torch.randint(0, 32000, (B, S, TOPK), dtype=torch.int32, device=device)
+        total_bytes = hidden.nbytes + topk_vals.nbytes + topk_idx.nbytes
+
+        if rank == 1:
+            fc        = nn.Linear(3*H, H, bias=False, dtype=torch.float32, device=device)
+            optimizer = torch.optim.AdamW(fc.parameters(), lr=1e-4)
+
+        if rank == 0:
+            print(f"[producer] tensor total={total_bytes/1e6:.1f} MB per step"
+                  f" (hidden={hidden.nbytes/1e6:.0f}MB topk={topk_vals.nbytes/1e6:.1f}MB)", flush=True)
+
+        latencies = []
+        for step in range(NUM_STEPS):
+            dist.barrier()
+            t0 = time.perf_counter()
+            if rank == 0:
+                dist.send(hidden,    dst=1)
+                dist.send(topk_vals, dst=1)
+                dist.send(topk_idx,  dst=1)
+                elapsed = time.perf_counter() - t0
+                if step >= WARMUP:
+                    latencies.append(elapsed)
+                    print(f"[producer] step {step:02d}: {elapsed*1000:.1f}ms  bw={total_bytes/elapsed/1e9:.2f}GB/s", flush=True)
+            else:
+                recv_h  = torch.empty_like(hidden)
+                recv_tv = torch.empty_like(topk_vals)
+                recv_ti = torch.empty_like(topk_idx)
+                dist.recv(recv_h,  src=0)
+                dist.recv(recv_tv, src=0)
+                dist.recv(recv_ti, src=0)
+                recv_elapsed = time.perf_counter() - t0
+                optimizer.zero_grad()
+                loss = fc(recv_h.float()).mean()
+                loss.backward(); optimizer.step()
+                train_elapsed = time.perf_counter() - t0
+                if step >= WARMUP:
+                    latencies.append(recv_elapsed)
+                    print(f"[consumer] step {step:02d}: recv={recv_elapsed*1000:.1f}ms"
+                          f" train={train_elapsed*1000:.1f}ms"
+                          f" bw={total_bytes/recv_elapsed/1e9:.2f}GB/s"
+                          f" loss={loss.item():.6f}", flush=True)
+
+        dist.barrier()
+        if latencies:
+            avg = sum(latencies)/len(latencies)
+            p95 = sorted(latencies)[int(len(latencies)*0.95)]
+            print(f"\n[rank {rank}] SUMMARY ({len(latencies)} steps):"
+                  f" avg={avg*1000:.1f}ms  p95={p95*1000:.1f}ms"
+                  f" avg_bw={total_bytes/avg/1e9:.2f}GB/s"
+                  f" tensor={total_bytes/1e6:.0f}MB", flush=True)
+        dist.destroy_process_group()
+        print(f"[rank {rank}] DONE.", flush=True)
+
+    if __name__ == "__main__":
+        main()
+
+---
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: eagle3-pc-demo
+  namespace: default
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: None
+    leaderTemplate:
+      metadata:
+        labels:
+          role: producer
+          app: eagle3-pc-demo
+      spec:
+        nodeName: host-10-83-115-10
+        hostNetwork: true
+        containers:
+        - name: worker
+          image: docker.io/library/speculators:v0.17.0
+          imagePullPolicy: Never
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            set -e
+            echo "=== EAGLE3 PC Demo — Phase 1 PRODUCER ==="
+            echo "  hostname: $(hostname)"
+            echo "  LWS_WORKER_INDEX: ${LWS_WORKER_INDEX}"
+            echo "  LWS_LEADER_ADDRESS: ${LWS_LEADER_ADDRESS}"
+            echo "  MASTER_ADDR: ${MASTER_ADDR}  MASTER_PORT: ${MASTER_PORT}"
+            nvidia-smi -L
+            echo "=== launching torchrun ==="
+            torchrun \
+              --nnodes=2 \
+              --nproc_per_node=1 \
+              --node_rank=0 \
+              --master_addr=${MASTER_ADDR} \
+              --master_port=${MASTER_PORT} \
+              /scripts/demo_p1_transfer.py
+            echo "=== PRODUCER DONE ==="
+            tail -f /dev/null
+          env:
+          - name: MASTER_ADDR
+            value: "10.83.115.10"
+          - name: MASTER_PORT
+            value: "29500"
+          - name: NCCL_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: GLOO_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: NCCL_IB_DISABLE
+            value: "0"
+          - name: NCCL_IB_GID_INDEX
+            value: "3"
+          - name: NCCL_DEBUG
+            value: "INFO"
+          - name: NCCL_DEBUG_SUBSYS
+            value: "INIT,P2P"
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+          - name: dshm
+            mountPath: /dev/shm
+          - name: infiniband
+            mountPath: /dev/infiniband
+        volumes:
+        - name: scripts
+          configMap:
+            name: eagle3-pc-demo-scripts
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: Directory
+    workerTemplate:
+      metadata:
+        labels:
+          role: consumer
+          app: eagle3-pc-demo
+      spec:
+        nodeName: host-10-83-115-14
+        hostNetwork: true
+        containers:
+        - name: worker
+          image: docker.io/library/speculators:v0.17.0
+          imagePullPolicy: Never
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            set -e
+            echo "=== EAGLE3 PC Demo — Phase 1 CONSUMER ==="
+            echo "  hostname: $(hostname)"
+            echo "  LWS_WORKER_INDEX: ${LWS_WORKER_INDEX}"
+            echo "  LWS_LEADER_ADDRESS: ${LWS_LEADER_ADDRESS}"
+            echo "  MASTER_ADDR: ${MASTER_ADDR}  MASTER_PORT: ${MASTER_PORT}"
+            nvidia-smi -L
+            echo "=== waiting 10s for producer to be ready ==="
+            sleep 10
+            echo "=== launching torchrun ==="
+            torchrun \
+              --nnodes=2 \
+              --nproc_per_node=1 \
+              --node_rank=1 \
+              --master_addr=${MASTER_ADDR} \
+              --master_port=${MASTER_PORT} \
+              /scripts/demo_p1_transfer.py
+            echo "=== CONSUMER DONE ==="
+            tail -f /dev/null
+          env:
+          - name: MASTER_ADDR
+            value: "10.83.115.10"
+          - name: MASTER_PORT
+            value: "29500"
+          - name: NCCL_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: GLOO_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: NCCL_IB_DISABLE
+            value: "0"
+          - name: NCCL_IB_GID_INDEX
+            value: "3"
+          - name: NCCL_DEBUG
+            value: "INFO"
+          - name: NCCL_DEBUG_SUBSYS
+            value: "INIT,P2P"
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+          - name: dshm
+            mountPath: /dev/shm
+          - name: infiniband
+            mountPath: /dev/infiniband
+        volumes:
+        - name: scripts
+          configMap:
+            name: eagle3-pc-demo-scripts
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: Directory
