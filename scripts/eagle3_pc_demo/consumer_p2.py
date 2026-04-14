@@ -67,12 +67,12 @@ class Eagle3HeadPOC(nn.Module):
         self.act  = nn.SiLU()
 
     def forward(self, aux_hs: torch.Tensor) -> torch.Tensor:
-        # aux_hs: [B, S, n_aux*H] bfloat16
-        x = self.fc(aux_hs)                    # [B, S, H] bfloat16
-        x = self.norm(x.float()).bfloat16()    # LayerNorm in fp32 for stability
+        # aux_hs: [B, S, n_aux*H] float32 (caller casts from bfloat16)
+        x = self.fc(aux_hs)                    # [B, S, H] float32
+        x = self.norm(x)                       # LayerNorm in fp32 (all params float32)
         residual = x
         x = self.w2(self.act(self.w1(x)))      # [B, S, H] MLP
-        return x + residual                    # [B, S, H]
+        return x + residual                    # [B, S, H] float32
 
 
 def wait_for_producer_ready(producer_addr: str, sync_port: int = SYNC_PORT, poll_interval: float = 5.0):
@@ -109,10 +109,10 @@ def main():
     master_port = int(os.environ.get("MASTER_PORT", "29500"))
 
     # 1. Init Eagle3 head + optimizer early (while producer loads K2.5)
-    model = Eagle3HeadPOC(H=H, n_aux=N_AUX).to(device=device, dtype=torch.bfloat16)
+    model = Eagle3HeadPOC(H=H, n_aux=N_AUX).to(device=device)  # float32 — avoids LayerNorm dtype mismatch with bfloat16 model
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     n_params = sum(p.numel() for p in model.parameters())
-    log.info(f"Eagle3HeadPOC: {n_params:,} parameters  device={device}")
+    log.info(f"Eagle3HeadPOC: {n_params:,} parameters  device={device}  dtype=float32")
 
     # 2. Wait for producer to finish loading K2.5 via TCP sync.
     #    No NCCL P2P calls during this phase — avoids NCCL QP idle timeout.
@@ -160,10 +160,10 @@ def main():
             dist.recv(last_buf, src=0)
             recv_t = time.perf_counter() - t0
 
-            # Forward + loss + backward
+            # Forward + loss + backward (cast bfloat16 network inputs to float32)
             optimizer.zero_grad()
-            draft_hs = model(aux_buf)                                   # [B, S, H] bf16
-            loss = F.mse_loss(draft_hs.float(), last_buf.float())       # MSE vs verifier last hs
+            draft_hs = model(aux_buf.float())                           # [B, S, H] float32
+            loss = F.mse_loss(draft_hs, last_buf.float())               # MSE vs verifier last hs
             loss.backward()
             optimizer.step()
             train_t = time.perf_counter() - t0
