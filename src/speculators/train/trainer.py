@@ -241,6 +241,12 @@ class Trainer:
 
     def run_training(self):
         n_epochs = self.config.num_epochs
+
+        if self.current_epoch == 0 and self.val_loader is not None:
+            root_logger.info("Running initial validation on pretrain weights (before epoch 0)")
+            self.val_epoch(0)
+            root_logger.info("Initial validation on pretrain weights completed")
+
         for epoch in range(self.current_epoch, n_epochs):
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
             self.train_epoch(epoch)
