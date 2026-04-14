@@ -108,35 +108,40 @@ def main():
     log.info(f"Waiting for producer (B={B} S={S} H={H}) ...")
 
     losses = []
-    for step in range(NUM_STEPS):
-        t0 = time.perf_counter()
+    try:
+        for step in range(NUM_STEPS):
+            t0 = time.perf_counter()
 
-        # Receive hidden states from producer (rank 0)
-        dist.recv(aux_buf, src=0)
-        dist.recv(last_buf, src=0)
-        recv_t = time.perf_counter() - t0
+            # Receive hidden states from producer (rank 0)
+            dist.recv(aux_buf, src=0)
+            dist.recv(last_buf, src=0)
+            recv_t = time.perf_counter() - t0
 
-        # Forward + loss + backward
-        optimizer.zero_grad()
-        draft_hs = model(aux_buf)                                   # [B, S, H] bf16
-        loss = F.mse_loss(draft_hs.float(), last_buf.float())       # MSE vs verifier last hs
-        loss.backward()
-        optimizer.step()
-        train_t = time.perf_counter() - t0
+            # Forward + loss + backward
+            optimizer.zero_grad()
+            draft_hs = model(aux_buf)                                   # [B, S, H] bf16
+            loss = F.mse_loss(draft_hs.float(), last_buf.float())       # MSE vs verifier last hs
+            loss.backward()
+            optimizer.step()
+            train_t = time.perf_counter() - t0
 
-        loss_val = loss.item()
-        losses.append(loss_val)
+            loss_val = loss.item()
+            losses.append(loss_val)
 
-        # Send loss scalar back to producer
-        loss_send[0] = loss_val
-        dist.send(loss_send, dst=0)
+            # Send loss scalar back to producer
+            loss_send[0] = loss_val
+            dist.send(loss_send, dst=0)
 
-        log.info(
-            f"step {step:02d}: recv={recv_t*1000:.1f}ms  "
-            f"train={train_t*1000:.1f}ms  "
-            f"bw={transfer_bytes/recv_t/1e9:.2f}GB/s  "
-            f"loss={loss_val:.4f}"
-        )
+            log.info(
+                f"step {step:02d}: recv={recv_t*1000:.1f}ms  "
+                f"train={train_t*1000:.1f}ms  "
+                f"bw={transfer_bytes/recv_t/1e9:.2f}GB/s  "
+                f"loss={loss_val:.4f}"
+            )
+    except Exception as e:
+        log.error(f"EXCEPTION in consumer loop: {type(e).__name__}: {e}")
+        log.error(traceback.format_exc())
+        raise
 
     if losses:
         log.info(f"\n=== CONSUMER SUMMARY ({NUM_STEPS} steps) ===")
