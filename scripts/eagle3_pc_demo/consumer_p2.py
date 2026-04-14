@@ -43,6 +43,7 @@ B, S      = 2, 128
 LR        = 1e-4
 NUM_STEPS = 10
 SYNC_PORT = 29501   # TCP sync port: wait for producer's "ready" before init NCCL
+P2P_PORT  = int(os.environ.get("P2P_NCCL_PORT", "29503"))  # fresh port for P2P NCCL group
 
 
 class Eagle3HeadPOC(nn.Module):
@@ -119,12 +120,12 @@ def main():
 
     # 3. Init P2P dist group — both sides ready now, init completes quickly
     from datetime import timedelta
-    log.info(f"Init P2P dist group: rank=1 world_size=2 addr={master_addr}:{master_port}")
+    log.info(f"Init P2P dist group: rank=1 world_size=2 addr={master_addr}:{P2P_PORT}")
     dist.init_process_group(
         backend="nccl",
         rank=1,
         world_size=2,
-        init_method=f"tcp://{master_addr}:{master_port}",
+        init_method=f"tcp://{master_addr}:{P2P_PORT}",  # P2P_PORT=29503 avoids torchrun rendezvous on 29500
         timeout=timedelta(minutes=5),  # both sides ready, fast init
     )
     assert dist.get_rank() == 1 and dist.get_world_size() == 2

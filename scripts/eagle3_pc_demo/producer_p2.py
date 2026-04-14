@@ -44,6 +44,7 @@ NUM_STEPS   = 10
 WARMUP      = 2
 VLLM_PORT   = int(os.environ.get("VLLM_MASTER_PORT", "29502"))
 SYNC_PORT   = 29501              # TCP sync port: producer signals consumer when K2.5 ready
+P2P_PORT    = int(os.environ.get("P2P_NCCL_PORT", "29503"))  # fresh port for P2P NCCL group (avoids torchrun rendezvous on 29500)
 
 
 def tcp_signal_consumer(sync_port: int = SYNC_PORT):
@@ -147,12 +148,12 @@ def main():
     tcp_signal_consumer()
 
     from datetime import timedelta
-    log.info(f"Init P2P dist group: rank=0 world_size=2 addr={master_addr}:{master_port}")
+    log.info(f"Init P2P dist group: rank=0 world_size=2 addr={master_addr}:{P2P_PORT}")
     dist.init_process_group(
         backend="nccl",
         rank=0,
         world_size=2,
-        init_method=f"tcp://{master_addr}:{master_port}",
+        init_method=f"tcp://{master_addr}:{P2P_PORT}",  # P2P_PORT=29503 avoids torchrun rendezvous on 29500
         timeout=timedelta(minutes=5),  # both sides ready now, fast init
     )
     assert dist.get_rank() == 0 and dist.get_world_size() == 2
