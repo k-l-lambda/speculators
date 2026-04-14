@@ -94,15 +94,33 @@ def main():
     os.environ["MASTER_PORT"] = str(VLLM_PORT)
     log.info(f"Redirected MASTER_PORT to {VLLM_PORT} for vLLM TP workers")
 
-    # 2b. Remove NCCL_DEBUG / NCCL_DEBUG_SUBSYS before spawning vLLM workers.
-    #     With NCCL_DEBUG=INFO, 8 TP workers simultaneously write verbose NCCL output
-    #     to the shared stderr pipe. If 8 workers flood the pipe buffer before any
-    #     worker can complete TCPStore server creation, all workers silently block —
-    #     the TP group never initializes. Unsetting here ensures clean vLLM worker env.
-    for _k in ("NCCL_DEBUG", "NCCL_DEBUG_SUBSYS"):
-        if _k in os.environ:
-            log.info(f"Unsetting {_k} before vLLM worker spawn")
-            del os.environ[_k]
+    # 2b. Remove ALL torchrun / torch.distributed env vars before spawning vLLM workers.
+    #
+    #     torchrun injects: RANK=0, LOCAL_RANK=0, WORLD_SIZE=2, GROUP_RANK, ROLE_RANK,
+    #     ROLE_WORLD_SIZE, LOCAL_WORLD_SIZE, TORCHELASTIC_* — into the producer process.
+    #     With VLLM_WORKER_MULTIPROC_METHOD=spawn these are INHERITED by all 8 TP workers.
+    #
+    #     Hypothesis: workers inherit RANK=0 / WORLD_SIZE=2 from the P2P torchrun env.
+    #     If any vLLM/PyTorch init path reads these env vars (even as fallback defaults),
+    #     the TP group may mis-configure (e.g. rank 0 creates TCPStore expecting 2 workers
+    #     while ranks 1-7 try to join an 8-rank group → deadlock).
+    #     Clearing them guarantees workers start with a clean distributed environment.
+    #
+    #     Also remove NCCL_DEBUG/NCCL_DEBUG_SUBSYS: with NCCL_DEBUG=INFO, 8 TP workers
+    #     simultaneously flood the shared stderr pipe buffer, potentially blocking before
+    #     TCPStore server creation.
+    _clear_before_vllm = [
+        "RANK", "LOCAL_RANK", "WORLD_SIZE",
+        "GROUP_RANK", "GROUP_WORLD_SIZE",
+        "ROLE_RANK", "ROLE_WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "TORCHELASTIC_RESTART_COUNT", "TORCHELASTIC_MAX_RESTARTS",
+        "TORCHELASTIC_RUN_ID", "TORCHELASTIC_USE_AGENT_STORE",
+        "NCCL_DEBUG", "NCCL_DEBUG_SUBSYS",
+    ]
+    cleared = {k: os.environ.pop(k) for k in _clear_before_vllm if k in os.environ}
+    if cleared:
+        log.info(f"Cleared {len(cleared)} env vars before vLLM spawn: {list(cleared.keys())}")
 
     # 3. Init VllmHiddenStatesGenerator (spawns 8 worker subprocesses for TP=8)
     sys.path.insert(0, "/workspace/speculators/src")
