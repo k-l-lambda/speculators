@@ -7,15 +7,22 @@ Sends loss scalar back to producer each step.
 
 No speculators dependency — uses standard PyTorch only.
 
+Sync protocol (Phase 2b fix — deferred NCCL P2P init):
+  - Producer loads K2.5 (8-9 min), then opens TCP server on SYNC_PORT=29501
+  - Consumer polls SYNC_PORT until "ready" arrives, then both init NCCL P2P
+  - Avoids NCCL P2P idle timeout during long K2.5 loading window
+
 Eagle3HeadPOC architecture:
   FC(3*H → H) + LayerNorm + SiLU-MLP(H → 2H → H) residual
   Loss: MSE(eagle3_output, last_hs_from_verifier)
-  ~126M parameters for H=7168
+  ~360M parameters for H=7168
 """
 
 import os
 import time
+import socket
 import logging
+import traceback
 
 import torch
 import torch.nn as nn
@@ -35,6 +42,7 @@ N_AUX     = 3       # aux layer count (LAYER_IDS[0:3] = [2, 30, 58])
 B, S      = 2, 128
 LR        = 1e-4
 NUM_STEPS = 10
+SYNC_PORT = 29501   # TCP sync port: wait for producer's "ready" before init NCCL
 
 
 class Eagle3HeadPOC(nn.Module):
@@ -66,35 +74,69 @@ class Eagle3HeadPOC(nn.Module):
         return x + residual                    # [B, S, H]
 
 
+def wait_for_producer_ready(producer_addr: str, sync_port: int = SYNC_PORT, poll_interval: float = 5.0):
+    """
+    Poll producer's TCP sync port until "ready" signal received.
+
+    Producer opens this server only after K2.5 has finished loading (~8-9 min).
+    Consumer polls until it can connect, then both call dist.init_process_group()
+    at nearly the same time — avoiding NCCL P2P idle timeout.
+    """
+    log.info(f"TCP sync: polling {producer_addr}:{sync_port} every {poll_interval:.0f}s ...")
+    while True:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            s.connect((producer_addr, sync_port))
+            msg = s.recv(5)
+            s.close()
+            if msg == b"ready":
+                log.info("TCP sync: received 'ready' — producer K2.5 loaded, init NCCL now")
+                return
+            log.warning(f"TCP sync: unexpected message {msg!r}, retrying ...")
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            pass
+        time.sleep(poll_interval)
+
+
 def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
-    # 1. Init P2P dist group
-    from datetime import timedelta
     master_addr = os.environ.get("MASTER_ADDR", "10.83.115.10")
-    master_port = os.environ.get("MASTER_PORT", "29500")
-    log.info(f"Init P2P dist group: rank=1 world_size=2 addr={master_addr}:{master_port}")
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
-    assert dist.get_rank() == 1 and dist.get_world_size() == 2
-    log.info("P2P dist group initialized")
+    master_port = int(os.environ.get("MASTER_PORT", "29500"))
 
-    # 1b. P2P warm-up: force NCCL 2-rank communicator creation while both sides are alive.
-    #     Without this, lazy communicator setup on first dist.recv() can time out if
-    #     rank 0 (producer) is busy loading K2.5 and never triggers its side.
-    warmup = torch.zeros(1, dtype=torch.float32, device=device)
-    dist.recv(warmup, src=0)
-    dist.send(warmup, dst=0)
-    log.info("P2P NCCL communicator warm-up done — waiting for producer to load K2.5 ...")
-
-    # 2. Init Eagle3 head + optimizer
+    # 1. Init Eagle3 head + optimizer early (while producer loads K2.5)
     model = Eagle3HeadPOC(H=H, n_aux=N_AUX).to(device=device, dtype=torch.bfloat16)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"Eagle3HeadPOC: {n_params:,} parameters  device={device}")
 
-    # 3. Pre-allocate receive buffers (same shape every step)
+    # 2. Wait for producer to finish loading K2.5 via TCP sync.
+    #    No NCCL P2P calls during this phase — avoids NCCL QP idle timeout.
+    wait_for_producer_ready(master_addr, sync_port=SYNC_PORT)
+
+    # 3. Init P2P dist group — both sides ready now, init completes quickly
+    from datetime import timedelta
+    log.info(f"Init P2P dist group: rank=1 world_size=2 addr={master_addr}:{master_port}")
+    dist.init_process_group(
+        backend="nccl",
+        rank=1,
+        world_size=2,
+        init_method=f"tcp://{master_addr}:{master_port}",
+        timeout=timedelta(minutes=5),  # both sides ready, fast init
+    )
+    assert dist.get_rank() == 1 and dist.get_world_size() == 2
+    log.info("P2P dist group initialized")
+
+    # 3b. Warm-up: force NCCL 2-rank P2P communicator creation
+    warmup = torch.zeros(1, dtype=torch.float32, device=device)
+    dist.recv(warmup, src=0)
+    dist.send(warmup, dst=0)
+    log.info("P2P NCCL communicator warm-up done")
+
+    # 4. Pre-allocate receive buffers (same shape every step)
     aux_buf  = torch.empty(B, S, N_AUX * H, dtype=torch.bfloat16, device=device)
     last_buf = torch.empty(B, S, H,         dtype=torch.bfloat16, device=device)
     loss_send = torch.zeros(1, dtype=torch.float32, device=device)
@@ -105,7 +147,7 @@ def main():
         f"last_hs={last_buf.nbytes/1e6:.1f}MB  "
         f"total={transfer_bytes/1e6:.1f}MB/step"
     )
-    log.info(f"Waiting for producer (B={B} S={S} H={H}) ...")
+    log.info(f"Starting main loop (B={B} S={S} H={H}) ...")
 
     losses = []
     try:
@@ -149,7 +191,6 @@ def main():
             f"  loss: {losses[0]:.4f} → {losses[-1]:.4f} "
             f"({'↓ decreasing ✓' if losses[-1] < losses[0] else '↑ not decreasing'})"
         )
-        avg_bw = transfer_bytes / (sum(step_t for step_t in []) + 1e-9)
         log.info(f"  Eagle3HeadPOC params: {n_params:,}")
 
     dist.destroy_process_group()

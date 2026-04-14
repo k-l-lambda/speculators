@@ -9,6 +9,11 @@ NCCL port separation:
   - P2P group (rank 0 ↔ rank 1):  MASTER_PORT=29500  (set by torchrun)
   - vLLM TP-group (rank 0..7):     MASTER_PORT=29502  (overridden before vLLM init)
 
+Sync protocol (Phase 2b fix — deferred NCCL P2P init):
+  - Producer loads K2.5 (8-9 min), then opens TCP server on SYNC_PORT=29501
+  - Consumer polls SYNC_PORT until "ready" arrives, then both init NCCL P2P
+  - Avoids NCCL P2P idle timeout during long K2.5 loading window
+
 Tensor sizes (B=2, S=128, H=7168):
   aux_hs   [2, 128, 21504] bf16  = 11 MB
   last_hs  [2, 128,  7168] bf16  =  3.7 MB
@@ -18,6 +23,7 @@ Tensor sizes (B=2, S=128, H=7168):
 import os
 import sys
 import time
+import socket
 import logging
 
 import torch
@@ -37,6 +43,27 @@ B, S        = 2, 128             # batch=2, seq=128
 NUM_STEPS   = 10
 WARMUP      = 2
 VLLM_PORT   = int(os.environ.get("VLLM_MASTER_PORT", "29502"))
+SYNC_PORT   = 29501              # TCP sync port: producer signals consumer when K2.5 ready
+
+
+def tcp_signal_consumer(sync_port: int = SYNC_PORT):
+    """
+    Open a TCP server, wait for consumer to connect, reply 'ready', then close.
+
+    This simple handshake lets producer signal consumer that K2.5 has loaded,
+    so both sides can call dist.init_process_group() at nearly the same time.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", sync_port))
+    s.listen(1)
+    log.info(f"TCP sync: listening on port {sync_port}, waiting for consumer ...")
+    conn, addr = s.accept()
+    log.info(f"TCP sync: consumer connected from {addr}")
+    conn.sendall(b"ready")
+    conn.close()
+    s.close()
+    log.info("TCP sync: 'ready' sent — both sides will init NCCL now")
 
 
 def pack_hidden_states(results: list[dict], device: torch.device):
@@ -72,43 +99,17 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
-    # 1. Init P2P dist group — uses MASTER_ADDR:MASTER_PORT from torchrun env
-    from datetime import timedelta
     master_addr = os.environ.get("MASTER_ADDR", "10.83.115.10")
-    master_port = os.environ.get("MASTER_PORT", "29500")
-    log.info(f"Init P2P dist group: rank=0 world_size=2 addr={master_addr}:{master_port}")
-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
-    assert dist.get_rank() == 0 and dist.get_world_size() == 2
-    log.info("P2P dist group initialized")
+    master_port = int(os.environ.get("MASTER_PORT", "29500"))
 
-    # 1b. P2P warm-up: force NCCL 2-rank communicator creation NOW (before K2.5 loads).
-    #     Without this, the communicator is created lazily on the first dist.send(), which
-    #     requires rank 1 to be simultaneously available — but rank 1 may time out waiting
-    #     while rank 0 spends 10-20 min loading K2.5.
-    warmup = torch.zeros(1, dtype=torch.float32, device=device)
-    dist.send(warmup, dst=1)
-    dist.recv(warmup, src=1)
-    log.info("P2P NCCL communicator warm-up done")
-
-    # 2. Redirect MASTER_PORT for vLLM workers (must do before VllmHiddenStatesGenerator)
+    # 1. Clear ALL torchrun / torch.distributed env vars before spawning vLLM workers.
+    #    torchrun injects RANK=0, WORLD_SIZE=2, etc. into the producer process.
+    #    vLLM workers inherit these via multiprocessing.spawn → TP group mis-configures
+    #    (TCPStore server waits for 2 workers instead of 8 → deadlock).
+    #    Also redirect MASTER_PORT to the vLLM TP port (29502) before clearing.
     os.environ["MASTER_PORT"] = str(VLLM_PORT)
     log.info(f"Redirected MASTER_PORT to {VLLM_PORT} for vLLM TP workers")
 
-    # 2b. Remove ALL torchrun / torch.distributed env vars before spawning vLLM workers.
-    #
-    #     torchrun injects: RANK=0, LOCAL_RANK=0, WORLD_SIZE=2, GROUP_RANK, ROLE_RANK,
-    #     ROLE_WORLD_SIZE, LOCAL_WORLD_SIZE, TORCHELASTIC_* — into the producer process.
-    #     With VLLM_WORKER_MULTIPROC_METHOD=spawn these are INHERITED by all 8 TP workers.
-    #
-    #     Hypothesis: workers inherit RANK=0 / WORLD_SIZE=2 from the P2P torchrun env.
-    #     If any vLLM/PyTorch init path reads these env vars (even as fallback defaults),
-    #     the TP group may mis-configure (e.g. rank 0 creates TCPStore expecting 2 workers
-    #     while ranks 1-7 try to join an 8-rank group → deadlock).
-    #     Clearing them guarantees workers start with a clean distributed environment.
-    #
-    #     Also remove NCCL_DEBUG/NCCL_DEBUG_SUBSYS: with NCCL_DEBUG=INFO, 8 TP workers
-    #     simultaneously flood the shared stderr pipe buffer, potentially blocking before
-    #     TCPStore server creation.
     _clear_before_vllm = [
         "RANK", "LOCAL_RANK", "WORLD_SIZE",
         "GROUP_RANK", "GROUP_WORLD_SIZE",
@@ -122,7 +123,7 @@ def main():
     if cleared:
         log.info(f"Cleared {len(cleared)} env vars before vLLM spawn: {list(cleared.keys())}")
 
-    # 3. Init VllmHiddenStatesGenerator (spawns 8 worker subprocesses for TP=8)
+    # 2. Load K2.5 via VllmHiddenStatesGenerator (spawns 8 TP worker subprocesses)
     sys.path.insert(0, "/workspace/speculators/src")
     from speculators.data_generation.vllm_hidden_states_generator import (
         VllmHiddenStatesGenerator,
@@ -139,6 +140,29 @@ def main():
         enforce_eager=True,
     )
     log.info(f"K2.5 loaded in {time.time() - t_load:.1f}s")
+
+    # 3. TCP sync: signal consumer that K2.5 is loaded, then BOTH init NCCL P2P.
+    #    This avoids NCCL P2P idle timeout during the 8+ min K2.5 loading window.
+    #    (Previous approach: init NCCL P2P before K2.5 load → NCCL QP idle timeout.)
+    tcp_signal_consumer()
+
+    from datetime import timedelta
+    log.info(f"Init P2P dist group: rank=0 world_size=2 addr={master_addr}:{master_port}")
+    dist.init_process_group(
+        backend="nccl",
+        rank=0,
+        world_size=2,
+        init_method=f"tcp://{master_addr}:{master_port}",
+        timeout=timedelta(minutes=5),  # both sides ready now, fast init
+    )
+    assert dist.get_rank() == 0 and dist.get_world_size() == 2
+    log.info("P2P dist group initialized")
+
+    # 3b. Warm-up: force NCCL 2-rank P2P communicator creation before first send
+    warmup = torch.zeros(1, dtype=torch.float32, device=device)
+    dist.send(warmup, dst=1)
+    dist.recv(warmup, src=1)
+    log.info("P2P NCCL communicator warm-up done")
 
     # 4. Pre-allocate buffers (same shape every step)
     H = 7168

@@ -12,8 +12,9 @@
 #   - MSE loss vs last_hs; backward + AdamW step
 #   - Sends loss scalar back to producer
 #
-# NCCL port separation:
-#   MASTER_PORT=29500 → P2P group (producer ↔ consumer)
+# Sync protocol (deferred NCCL P2P init, avoids 8-min idle timeout):
+#   SYNC_PORT=29501   → TCP "ready" signal from producer after K2.5 loads
+#   MASTER_PORT=29500 → P2P NCCL group (init AFTER TCP sync, not before)
 #   MASTER_PORT=29502 → vLLM TP group (K2.5 workers on youyun.37)
 #
 # Usage:
@@ -41,9 +42,9 @@ data:
     EAGLE3 Producer-Consumer Demo Phase 2 - Producer (youyun.37)
     Loads K2.5 (TP=8) via VllmHiddenStatesGenerator.
     Sends hidden states [B,S,3H]+[B,S,H] to consumer via NCCL P2P.
-    NCCL port separation: P2P=29500, vLLM-TP=29502
+    Sync: TCP on SYNC_PORT=29501 signals consumer when K2.5 loaded; NCCL P2P init after.
     """
-    import os, sys, time, logging
+    import os, sys, time, socket, logging
     import torch, torch.distributed as dist
 
     logging.basicConfig(level=logging.INFO,
@@ -56,6 +57,7 @@ data:
     NUM_STEPS  = 10
     WARMUP     = 2
     VLLM_PORT  = int(os.environ.get("VLLM_MASTER_PORT", "29502"))
+    SYNC_PORT  = 29501
 
     def pack_hidden_states(results, device):
         n_aux = len(LAYER_IDS) - 1
@@ -67,37 +69,45 @@ data:
             last_list.append(hs[n_aux].to(device=device, dtype=torch.bfloat16))
         return torch.stack(aux_list), torch.stack(last_list)
 
+    def tcp_signal_consumer(sync_port):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", sync_port))
+        s.listen(1)
+        log.info(f"TCP sync: listening on :{sync_port}, waiting for consumer ...")
+        conn, addr = s.accept()
+        log.info(f"TCP sync: consumer connected from {addr}")
+        conn.sendall(b"ready")
+        conn.close()
+        s.close()
+        log.info("TCP sync: 'ready' sent — both sides will init NCCL now")
+
     def main():
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
 
-        from datetime import timedelta
-        log.info(f"Init P2P dist group rank=0 world=2 "
-                 f"{os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')}")
-        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
-        assert dist.get_rank() == 0 and dist.get_world_size() == 2
-        log.info("P2P dist group initialized")
+        master_addr = os.environ.get("MASTER_ADDR", "10.83.115.10")
+        master_port = int(os.environ.get("MASTER_PORT", "29500"))
 
-        # Warm-up P2P to force NCCL communicator creation before K2.5 load
-        warmup = torch.zeros(1, dtype=torch.float32, device=device)
-        dist.send(warmup, dst=1)
-        dist.recv(warmup, src=1)
-        log.info("P2P NCCL warm-up done")
-
+        # 1. Clear torchrun env vars + redirect MASTER_PORT before vLLM spawn
         os.environ["MASTER_PORT"] = str(VLLM_PORT)
         log.info(f"Redirected MASTER_PORT to {VLLM_PORT} for vLLM workers")
+        _clear_before_vllm = [
+            "RANK", "LOCAL_RANK", "WORLD_SIZE",
+            "GROUP_RANK", "GROUP_WORLD_SIZE", "ROLE_RANK", "ROLE_WORLD_SIZE",
+            "LOCAL_WORLD_SIZE",
+            "TORCHELASTIC_RESTART_COUNT", "TORCHELASTIC_MAX_RESTARTS",
+            "TORCHELASTIC_RUN_ID", "TORCHELASTIC_USE_AGENT_STORE",
+            "NCCL_DEBUG", "NCCL_DEBUG_SUBSYS",
+        ]
+        cleared = {k: os.environ.pop(k) for k in _clear_before_vllm if k in os.environ}
+        if cleared:
+            log.info(f"Cleared {len(cleared)} env vars before vLLM spawn: {list(cleared.keys())}")
 
-        # Remove NCCL_DEBUG before spawning vLLM workers.
-        # With NCCL_DEBUG=INFO, 8 TP workers simultaneously flood the shared stderr
-        # pipe, blocking all workers before TCPStore server creation.
-        for _k in ("NCCL_DEBUG", "NCCL_DEBUG_SUBSYS"):
-            if _k in os.environ:
-                del os.environ[_k]
-
+        # 2. Load K2.5 (8-9 min) — no NCCL P2P during this phase
         sys.path.insert(0, "/workspace/speculators/src")
         from speculators.data_generation.vllm_hidden_states_generator import VllmHiddenStatesGenerator
-
         log.info(f"Loading K2.5 TP=8 layers={LAYER_IDS} ...")
         t_load = time.time()
         generator = VllmHiddenStatesGenerator(
@@ -106,6 +116,25 @@ data:
             tensor_parallel_size=8, enforce_eager=True,
         )
         log.info(f"K2.5 loaded in {time.time()-t_load:.1f}s")
+
+        # 3. TCP sync: signal consumer K2.5 ready, then both init NCCL P2P
+        tcp_signal_consumer(SYNC_PORT)
+
+        from datetime import timedelta
+        log.info(f"Init P2P dist group rank=0 world=2 {master_addr}:{master_port}")
+        dist.init_process_group(
+            backend="nccl", rank=0, world_size=2,
+            init_method=f"tcp://{master_addr}:{master_port}",
+            timeout=timedelta(minutes=5),
+        )
+        assert dist.get_rank() == 0 and dist.get_world_size() == 2
+        log.info("P2P dist group initialized")
+
+        # 3b. Warm-up NCCL P2P communicator
+        warmup = torch.zeros(1, dtype=torch.float32, device=device)
+        dist.send(warmup, dst=1)
+        dist.recv(warmup, src=1)
+        log.info("P2P NCCL warm-up done")
 
         H = 7168
         aux_buf   = torch.empty(B, S, 3*H, dtype=torch.bfloat16, device=device)
@@ -154,9 +183,10 @@ data:
     EAGLE3 Producer-Consumer Demo Phase 2 - Consumer (host-10-83-115-14)
     Receives hidden states from producer via NCCL P2P.
     Eagle3HeadPOC: FC(3H->H) + LayerNorm + SiLU-MLP residual. MSE loss.
+    Sync: TCP poll on SYNC_PORT=29501 waits for producer 'ready'; NCCL P2P init after.
     No speculators dependency.
     """
-    import os, time, logging
+    import os, time, socket, logging, traceback
     import torch, torch.nn as nn, torch.nn.functional as F, torch.distributed as dist
 
     logging.basicConfig(level=logging.INFO,
@@ -167,6 +197,7 @@ data:
     B, S       = 2, 128
     LR         = 1e-4
     NUM_STEPS  = 10
+    SYNC_PORT  = 29501
 
     class Eagle3HeadPOC(nn.Module):
         def __init__(self, H=7168, n_aux=3):
@@ -181,55 +212,87 @@ data:
             x = self.norm(x.float()).bfloat16()
             return x + self.w2(self.act(self.w1(x)))
 
+    def wait_for_producer_ready(producer_addr, sync_port=SYNC_PORT, poll_interval=5.0):
+        log.info(f"TCP sync: polling {producer_addr}:{sync_port} every {poll_interval:.0f}s ...")
+        while True:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5.0)
+                s.connect((producer_addr, sync_port))
+                msg = s.recv(5)
+                s.close()
+                if msg == b"ready":
+                    log.info("TCP sync: received 'ready' — producer K2.5 loaded, init NCCL now")
+                    return
+            except (ConnectionRefusedError, socket.timeout, OSError):
+                pass
+            time.sleep(poll_interval)
+
     def main():
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
 
-        from datetime import timedelta
-        log.info(f"Init P2P dist group rank=1 world=2 "
-                 f"{os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')}")
-        dist.init_process_group(backend="nccl", timeout=timedelta(minutes=60))
-        assert dist.get_rank() == 1 and dist.get_world_size() == 2
-        log.info("P2P dist group initialized")
+        master_addr = os.environ.get("MASTER_ADDR", "10.83.115.10")
+        master_port = int(os.environ.get("MASTER_PORT", "29500"))
 
-        # Warm-up P2P to force NCCL communicator creation before producer loads K2.5
-        warmup = torch.zeros(1, dtype=torch.float32, device=device)
-        dist.recv(warmup, src=0)
-        dist.send(warmup, dst=0)
-        log.info("P2P NCCL warm-up done — waiting for producer to load K2.5 ...")
-
+        # 1. Init Eagle3 head + optimizer while producer loads K2.5
         model = Eagle3HeadPOC(H=H, n_aux=N_AUX).to(device=device, dtype=torch.bfloat16)
         optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
         n_params = sum(p.numel() for p in model.parameters())
         log.info(f"Eagle3HeadPOC: {n_params:,} params  device={device}")
 
+        # 2. Wait for producer to finish loading K2.5 (TCP poll, no NCCL during this phase)
+        wait_for_producer_ready(master_addr, sync_port=SYNC_PORT)
+
+        # 3. Init P2P dist group — both sides ready now, fast init
+        from datetime import timedelta
+        log.info(f"Init P2P dist group rank=1 world=2 {master_addr}:{master_port}")
+        dist.init_process_group(
+            backend="nccl", rank=1, world_size=2,
+            init_method=f"tcp://{master_addr}:{master_port}",
+            timeout=timedelta(minutes=5),
+        )
+        assert dist.get_rank() == 1 and dist.get_world_size() == 2
+        log.info("P2P dist group initialized")
+
+        # 3b. Warm-up NCCL P2P communicator
+        warmup = torch.zeros(1, dtype=torch.float32, device=device)
+        dist.recv(warmup, src=0)
+        dist.send(warmup, dst=0)
+        log.info("P2P NCCL warm-up done — starting main loop")
+
         aux_buf   = torch.empty(B, S, N_AUX*H, dtype=torch.bfloat16, device=device)
         last_buf  = torch.empty(B, S, H,       dtype=torch.bfloat16, device=device)
         loss_send = torch.zeros(1, dtype=torch.float32, device=device)
         nb = aux_buf.nbytes + last_buf.nbytes
-        log.info(f"Buffers: {nb/1e6:.1f} MB/step  Waiting for producer ...")
+        log.info(f"Buffers: {nb/1e6:.1f} MB/step")
 
         losses = []
-        for step in range(NUM_STEPS):
-            t0 = time.perf_counter()
-            dist.recv(aux_buf, src=0)
-            dist.recv(last_buf, src=0)
-            recv_t = time.perf_counter() - t0
+        try:
+            for step in range(NUM_STEPS):
+                t0 = time.perf_counter()
+                dist.recv(aux_buf, src=0)
+                dist.recv(last_buf, src=0)
+                recv_t = time.perf_counter() - t0
 
-            optimizer.zero_grad()
-            draft_hs = model(aux_buf)
-            loss = F.mse_loss(draft_hs.float(), last_buf.float())
-            loss.backward()
-            optimizer.step()
-            train_t = time.perf_counter() - t0
+                optimizer.zero_grad()
+                draft_hs = model(aux_buf)
+                loss = F.mse_loss(draft_hs.float(), last_buf.float())
+                loss.backward()
+                optimizer.step()
+                train_t = time.perf_counter() - t0
 
-            loss_val = loss.item()
-            losses.append(loss_val)
-            loss_send[0] = loss_val
-            dist.send(loss_send, dst=0)
-            log.info(f"step {step:02d}: recv={recv_t*1000:.1f}ms train={train_t*1000:.1f}ms "
-                     f"bw={nb/recv_t/1e9:.2f}GB/s loss={loss_val:.4f}")
+                loss_val = loss.item()
+                losses.append(loss_val)
+                loss_send[0] = loss_val
+                dist.send(loss_send, dst=0)
+                log.info(f"step {step:02d}: recv={recv_t*1000:.1f}ms train={train_t*1000:.1f}ms "
+                         f"bw={nb/recv_t/1e9:.2f}GB/s loss={loss_val:.4f}")
+        except Exception as e:
+            log.error(f"EXCEPTION in consumer loop: {type(e).__name__}: {e}")
+            log.error(traceback.format_exc())
+            raise
 
         if losses:
             log.info(f"\n=== CONSUMER SUMMARY ({NUM_STEPS} steps) ===")
@@ -384,9 +447,11 @@ spec:
           - name: GLOO_SOCKET_IFNAME
             value: "b_manage0"
           - name: NCCL_IB_DISABLE
-            value: "0"
+            value: "1"
           - name: NCCL_IB_GID_INDEX
             value: "3"
+          - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+            value: "0"
           resources:
             limits:
               nvidia.com/gpu: "1"
