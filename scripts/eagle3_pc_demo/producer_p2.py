@@ -94,6 +94,16 @@ def main():
     os.environ["MASTER_PORT"] = str(VLLM_PORT)
     log.info(f"Redirected MASTER_PORT to {VLLM_PORT} for vLLM TP workers")
 
+    # 2b. Remove NCCL_DEBUG / NCCL_DEBUG_SUBSYS before spawning vLLM workers.
+    #     With NCCL_DEBUG=INFO, 8 TP workers simultaneously write verbose NCCL output
+    #     to the shared stderr pipe. If 8 workers flood the pipe buffer before any
+    #     worker can complete TCPStore server creation, all workers silently block —
+    #     the TP group never initializes. Unsetting here ensures clean vLLM worker env.
+    for _k in ("NCCL_DEBUG", "NCCL_DEBUG_SUBSYS"):
+        if _k in os.environ:
+            log.info(f"Unsetting {_k} before vLLM worker spawn")
+            del os.environ[_k]
+
     # 3. Init VllmHiddenStatesGenerator (spawns 8 worker subprocesses for TP=8)
     sys.path.insert(0, "/workspace/speculators/src")
     from speculators.data_generation.vllm_hidden_states_generator import (

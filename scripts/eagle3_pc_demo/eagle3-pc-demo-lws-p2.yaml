@@ -88,6 +88,13 @@ data:
         os.environ["MASTER_PORT"] = str(VLLM_PORT)
         log.info(f"Redirected MASTER_PORT to {VLLM_PORT} for vLLM workers")
 
+        # Remove NCCL_DEBUG before spawning vLLM workers.
+        # With NCCL_DEBUG=INFO, 8 TP workers simultaneously flood the shared stderr
+        # pipe, blocking all workers before TCPStore server creation.
+        for _k in ("NCCL_DEBUG", "NCCL_DEBUG_SUBSYS"):
+            if _k in os.environ:
+                del os.environ[_k]
+
         sys.path.insert(0, "/workspace/speculators/src")
         from speculators.data_generation.vllm_hidden_states_generator import VllmHiddenStatesGenerator
 
@@ -295,10 +302,6 @@ spec:
             value: "0"
           - name: NCCL_IB_GID_INDEX
             value: "3"
-          - name: NCCL_DEBUG
-            value: "INFO"
-          - name: NCCL_DEBUG_SUBSYS
-            value: "INIT,P2P"
           - name: HF_HUB_OFFLINE
             value: "1"
           - name: TRANSFORMERS_OFFLINE
@@ -384,10 +387,6 @@ spec:
             value: "0"
           - name: NCCL_IB_GID_INDEX
             value: "3"
-          - name: NCCL_DEBUG
-            value: "INFO"
-          - name: NCCL_DEBUG_SUBSYS
-            value: "INIT,P2P"
           resources:
             limits:
               nvidia.com/gpu: "1"
