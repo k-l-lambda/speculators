@@ -1,0 +1,336 @@
+"""
+EAGLE3 Producer-Consumer Phase 4 — Consumer (host-10-83-115-14)
+
+Key improvements over Phase 3:
+  - MAX_SEQ_LEN: 4096 (was 2048) — matches offline training data distribution
+  - Starting checkpoint: Phase 2 epoch 7 (71.4% val acc baseline)
+  - NaN scrubbing done on producer side — consumer NaN skips should be near zero
+  - float32 model precision retained (stable KL divergence)
+
+Transfer protocol (producer → consumer, fixed MAX_SEQ_LEN=4096):
+  meta     [1]                   int64   actual seq_len
+  aux_hs   [1, MAX_SEQ_LEN, 3H]  bf16    hidden states (padded, NaN-scrubbed)
+  last_hs  [1, MAX_SEQ_LEN, H]   bf16    verifier last hidden state (padded)
+  input_ids [1, MAX_SEQ_LEN]     int64   (padded with 0)
+  loss_mask [1, MAX_SEQ_LEN]     float32 (padded with 0.0)
+  loss      [1]                   float32 consumer → producer
+"""
+
+import os
+import sys
+import time
+import json
+import socket
+import logging
+import traceback
+from pathlib import Path
+from datetime import timedelta
+
+import torch
+import torch.distributed as dist
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d [consumer] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ---- Config ----
+CKPT_IN_DIR    = os.environ.get("EAGLE3_CKPT_DIR",   "/data/training/eagle3_v2_apilog/7")
+VOCAB_DIR      = os.environ.get("EAGLE3_VOCAB_DIR",  "/data/training/eagle3_v2_apilog/7")
+CKPT_OUT_DIR   = os.environ.get("EAGLE3_OUT_DIR",    "/data/training/eagle3_v4_online")
+K2_5_PATH      = os.environ.get("K2_5_MODEL_PATH",   "/data/models/Kimi-K2.5")
+
+H              = 7168
+MAX_SEQ_LEN    = 4096
+LR             = 1e-5
+WARMUP_STEPS   = 100
+LR_MIN_FACTOR  = 0.1
+CKPT_INTERVAL  = 500
+LOG_INTERVAL   = 50
+GRAD_CLIP      = 1.0
+TTT_STEPS      = 3
+TTT_DECAY      = 1.0
+
+SYNC_PORT  = 29501
+P2P_PORT   = int(os.environ.get("P2P_NCCL_PORT", "29503"))
+
+
+# ---- Checkpoint loading ----
+
+def patch_config(ckpt_dir: str, k2_5_path: str):
+    config_path = Path(ckpt_dir) / "config.json"
+    with open(config_path) as f:
+        cfg = json.load(f)
+    verifier = cfg["speculators_config"]["verifier"]
+    old_path = verifier.get("name_or_path", "")
+    if old_path != k2_5_path:
+        verifier["name_or_path"] = k2_5_path
+        with open(config_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+        log.info(f"Patched verifier.name_or_path: {old_path!r} → {k2_5_path!r}")
+    else:
+        log.info(f"Config already points to {k2_5_path!r}, no patch needed")
+
+
+def load_eagle3(ckpt_dir: str, vocab_dir: str, device: torch.device):
+    import numpy as np
+    from speculators.models.eagle3 import Eagle3SpeculatorConfig
+    from speculators.models.eagle3.core import Eagle3DraftModel
+    from safetensors.torch import load_file as load_safetensors
+
+    ckpt_path = Path(ckpt_dir)
+
+    d2t = torch.from_numpy(np.load(str(Path(vocab_dir) / "d2t.npy")))
+    t2d = torch.from_numpy(np.load(str(Path(vocab_dir) / "t2d.npy")))
+    log.info(f"Vocab mappings: d2t={d2t.shape} t2d={t2d.shape}")
+
+    config = Eagle3SpeculatorConfig.from_pretrained(str(ckpt_path))
+    log.info(
+        f"Eagle3 config: draft_vocab={config.draft_vocab_size}  "
+        f"verifier={config.speculators_config.verifier.name_or_path}"
+    )
+
+    log.info("Building Eagle3DraftModel (loading K2.5 embeddings) ...")
+    model = Eagle3DraftModel(config, t2d=t2d, d2t=d2t)
+
+    shard_files = sorted(ckpt_path.glob("model-*.safetensors"))
+    if not shard_files:
+        shard_files = [ckpt_path / "model.safetensors"]
+
+    log.info(f"Loading {len(shard_files)} safetensors shard(s) ...")
+    state_dict: dict = {}
+    for shard in shard_files:
+        state_dict.update(load_safetensors(str(shard), device="cpu"))
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    log.info(f"  Missing keys: {len(missing)} (expected: verifier weights not saved)")
+    if unexpected:
+        log.warning(f"  Unexpected keys: {unexpected[:5]}")
+
+    # float32 for numerically stable KL divergence
+    model = model.to(device=device, dtype=torch.float32)
+    model.train()
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(f"Eagle3DraftModel loaded: {n_params:,} trainable params  dtype=float32  device={device}")
+    return model, d2t, t2d
+
+
+# ---- TCP sync ----
+
+def wait_for_producer_ready(producer_addr: str, sync_port: int = SYNC_PORT, poll_interval: float = 5.0):
+    log.info(f"TCP sync: polling {producer_addr}:{sync_port} every {poll_interval:.0f}s ...")
+    while True:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            s.connect((producer_addr, sync_port))
+            msg = s.recv(5)
+            s.close()
+            if msg == b"ready":
+                log.info("TCP sync: received 'ready' — producer K2.5 loaded, init NCCL now")
+                return
+            log.warning(f"TCP sync: unexpected message {msg!r}, retrying ...")
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            pass
+        time.sleep(poll_interval)
+
+
+# ---- Checkpoint saving ----
+
+def save_checkpoint(model, optimizer, scheduler, step: int, out_dir: str):
+    from safetensors.torch import save_file as save_safetensors
+    ckpt_dir = Path(out_dir) / str(step)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    state_dict = {k: v for k, v in model.state_dict().items()
+                  if k not in (model._keys_to_ignore_on_save or [])}
+    save_safetensors(state_dict, str(ckpt_dir / "model.safetensors"))
+
+    torch.save(optimizer.state_dict(), str(ckpt_dir / "optimizer_state_dict.pt"))
+    if scheduler is not None:
+        torch.save(scheduler.state_dict(), str(ckpt_dir / "scheduler_state_dict.pt"))
+
+    import shutil
+    for fname in ("config.json", "config.py"):
+        src = Path(CKPT_IN_DIR) / fname
+        if src.exists():
+            shutil.copy2(src, ckpt_dir / fname)
+
+    log.info(f"Checkpoint saved → {ckpt_dir}")
+
+
+# ---- Main ----
+
+def main():
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    master_addr = os.environ.get("MASTER_ADDR", "10.83.115.10")
+
+    patch_config(CKPT_IN_DIR, K2_5_PATH)
+
+    speculators_src = os.environ.get("SPECULATORS_PATH", "")
+    if speculators_src:
+        sys.path.insert(0, speculators_src)
+        log.info(f"speculators path override: {speculators_src}")
+    else:
+        log.info("using installed speculators package")
+    model, d2t, t2d = load_eagle3(CKPT_IN_DIR, VOCAB_DIR, device)
+
+    if model.d2t is not None:
+        model.d2t = model.d2t.to(device)
+    if model.t2d is not None:
+        model.t2d = model.t2d.to(device)
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=LR, betas=(0.9, 0.999), weight_decay=0.01,
+    )
+
+    import math
+
+    def lr_lambda_fn(step: int) -> float:
+        if step < WARMUP_STEPS:
+            return (step + 1) / max(WARMUP_STEPS, 1)
+        progress = (step - WARMUP_STEPS) / max(1, 1_000_000 - WARMUP_STEPS)
+        progress = min(progress, 1.0)
+        return LR_MIN_FACTOR + (1.0 - LR_MIN_FACTOR) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda_fn)
+
+    wait_for_producer_ready(master_addr, sync_port=SYNC_PORT)
+
+    log.info(f"Init P2P dist group: rank=1 world=2 addr={master_addr}:{P2P_PORT}")
+    dist.init_process_group(
+        backend="nccl", rank=1, world_size=2,
+        init_method=f"tcp://{master_addr}:{P2P_PORT}",
+        timeout=timedelta(minutes=5),
+    )
+    assert dist.get_rank() == 1 and dist.get_world_size() == 2
+    log.info("P2P dist group initialized")
+
+    warmup_t = torch.zeros(1, dtype=torch.float32, device=device)
+    dist.recv(warmup_t, src=0)
+    dist.send(warmup_t, dst=0)
+    log.info("P2P NCCL communicator warm-up done — starting training loop")
+
+    # Pre-allocate receive buffers (4096 seq_len)
+    meta_recv  = torch.zeros(1, dtype=torch.int64,    device=device)
+    aux_buf    = torch.empty(1, MAX_SEQ_LEN, 3 * H,   dtype=torch.bfloat16, device=device)
+    last_buf   = torch.empty(1, MAX_SEQ_LEN, H,       dtype=torch.bfloat16, device=device)
+    ids_buf    = torch.empty(1, MAX_SEQ_LEN,           dtype=torch.int64,    device=device)
+    mask_buf   = torch.empty(1, MAX_SEQ_LEN,           dtype=torch.float32,  device=device)
+    loss_send  = torch.zeros(1, dtype=torch.float32,  device=device)
+
+    nb = aux_buf.nbytes + last_buf.nbytes + ids_buf.nbytes + mask_buf.nbytes
+    log.info(f"Receive buffers: {nb/1e6:.0f} MB/step  (MAX_SEQ_LEN={MAX_SEQ_LEN})")
+
+    Path(CKPT_OUT_DIR).mkdir(parents=True, exist_ok=True)
+
+    losses = []
+    global_step = 0
+
+    try:
+        while True:
+            t0 = time.perf_counter()
+
+            dist.recv(meta_recv, src=0)
+            seq_len = int(meta_recv[0].item())
+
+            dist.recv(aux_buf, src=0)
+            dist.recv(last_buf, src=0)
+            dist.recv(ids_buf, src=0)
+            dist.recv(mask_buf, src=0)
+            recv_t = time.perf_counter() - t0
+
+            aux_hs    = aux_buf[:, :seq_len, :].contiguous()
+            last_hs   = last_buf[:, :seq_len, :].contiguous()
+            input_ids = ids_buf[:, :seq_len].contiguous()
+            loss_mask = mask_buf[:, :seq_len].contiguous()
+            lengths   = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+            # NaN guard (producer scrubs, but keep as safety net)
+            if not (torch.isfinite(aux_hs).all() and torch.isfinite(last_hs).all()):
+                log.warning(f"step {global_step}: NaN/Inf in received hidden states, skipping")
+                loss_send[0] = float('nan')
+                dist.send(loss_send, dst=0)
+                global_step += 1
+                continue
+
+            aux_hs_f32  = aux_hs.float()
+            last_hs_f32 = last_hs.float()
+
+            optimizer.zero_grad()
+            _draft_tokens, loss, metrics = model(
+                hidden_states=aux_hs_f32,
+                input_ids=input_ids,
+                lengths=lengths,
+                loss_mask=loss_mask,
+                verifier_last_hidden_states=last_hs_f32,
+                ttt_steps=TTT_STEPS,
+                ttt_step_loss_decay=TTT_DECAY,
+            )
+
+            loss_val = loss.item()
+            if not torch.isfinite(loss):
+                log.warning(f"step {global_step}: loss={loss_val} non-finite, skipping backward")
+                loss_send[0] = loss_val
+                dist.send(loss_send, dst=0)
+                global_step += 1
+                continue
+
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            if not torch.isfinite(grad_norm):
+                log.warning(f"step {global_step}: grad_norm non-finite, skipping optimizer step")
+                optimizer.zero_grad()
+            else:
+                optimizer.step()
+            scheduler.step()
+            train_t = time.perf_counter() - t0
+
+            losses.append(loss_val)
+            loss_send[0] = loss_val
+            dist.send(loss_send, dst=0)
+
+            if global_step % LOG_INTERVAL == 0:
+                lr_now = optimizer.param_groups[0]["lr"]
+                full_acc = metrics.get("full_acc_0", torch.tensor(0.0))
+                full_acc = full_acc.item() if isinstance(full_acc, torch.Tensor) else full_acc
+                log.info(
+                    f"step {global_step:06d}: seq_len={seq_len}  "
+                    f"recv={recv_t*1000:.1f}ms  train={train_t*1000:.0f}ms  "
+                    f"bw={nb/recv_t/1e9:.2f}GB/s  "
+                    f"loss={loss_val:.4f}  full_acc_0={full_acc:.4f}  lr={lr_now:.2e}"
+                )
+
+            if (global_step + 1) % CKPT_INTERVAL == 0:
+                save_checkpoint(model, optimizer, scheduler, global_step + 1, CKPT_OUT_DIR)
+
+            global_step += 1
+
+    except Exception as e:
+        log.error(f"EXCEPTION at step {global_step}: {type(e).__name__}: {e}")
+        log.error(traceback.format_exc())
+        raise
+
+    finally:
+        if losses:
+            log.info(f"\n=== CONSUMER SUMMARY ({global_step} steps) ===")
+            log.info(
+                f"  loss: {losses[0]:.4f} → {losses[-1]:.4f} "
+                f"({'↓ decreasing' if losses[-1] < losses[0] else '↑ not decreasing'})"
+            )
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+        log.info("DONE")
+
+
+if __name__ == "__main__":
+    main()
