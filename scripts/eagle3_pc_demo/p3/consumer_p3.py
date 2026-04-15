@@ -121,11 +121,13 @@ def load_eagle3(ckpt_dir: str, vocab_dir: str, device: torch.device):
     if unexpected:
         log.warning(f"  Unexpected keys: {unexpected[:5]}")
 
-    model = model.to(device=device, dtype=torch.bfloat16)
+    # Use float32 for numerically stable KL divergence computation
+    # (bfloat16 loses precision in log_softmax causing NaN at high initial loss values)
+    model = model.to(device=device, dtype=torch.float32)
     model.train()
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info(f"Eagle3DraftModel loaded: {n_params:,} trainable params  dtype=bfloat16  device={device}")
+    log.info(f"Eagle3DraftModel loaded: {n_params:,} trainable params  dtype=float32  device={device}")
     return model, d2t, t2d
 
 
@@ -189,9 +191,13 @@ def main():
     patch_config(CKPT_IN_DIR, K2_5_PATH)
 
     # 2. Load Eagle3 from checkpoint (while producer loads K2.5)
-    speculators_src = os.environ.get("SPECULATORS_PATH", "/workspace/speculators/src")
-    sys.path.insert(0, speculators_src)
-    log.info(f"speculators path: {speculators_src}")
+    # Optional: add custom speculators source to path (falls back to installed package)
+    speculators_src = os.environ.get("SPECULATORS_PATH", "")
+    if speculators_src:
+        sys.path.insert(0, speculators_src)
+        log.info(f"speculators path override: {speculators_src}")
+    else:
+        log.info("using installed speculators package")
     model, d2t, t2d = load_eagle3(CKPT_IN_DIR, VOCAB_DIR, device)
 
     # Move vocab mappings to device
@@ -274,24 +280,50 @@ def main():
             loss_mask = mask_buf[:, :seq_len].contiguous()     # [1, S]
             lengths   = torch.tensor([seq_len], dtype=torch.long, device=device)
 
+            # Guard: skip step if hidden states contain NaN/Inf
+            if not (torch.isfinite(aux_hs).all() and torch.isfinite(last_hs).all()):
+                log.warning(f"step {global_step}: NaN/Inf in received hidden states, skipping")
+                loss_send[0] = float('nan')
+                dist.send(loss_send, dst=0)
+                global_step += 1
+                continue
+
+            # Cast hidden states to float32 to match model precision
+            aux_hs_f32  = aux_hs.float()
+            last_hs_f32 = last_hs.float()
+
             # Forward + loss + backward
             optimizer.zero_grad()
             _draft_tokens, loss, metrics = model(
-                hidden_states=aux_hs,
+                hidden_states=aux_hs_f32,
                 input_ids=input_ids,
                 lengths=lengths,
                 loss_mask=loss_mask,
-                verifier_last_hidden_states=last_hs,   # triggers KL loss
+                verifier_last_hidden_states=last_hs_f32,   # triggers KL loss
                 ttt_steps=TTT_STEPS,
                 ttt_step_loss_decay=TTT_DECAY,
             )
+
+            # Guard: skip backward if loss is NaN/Inf (prevent weight corruption)
+            loss_val = loss.item()
+            if not torch.isfinite(loss):
+                log.warning(f"step {global_step}: loss={loss_val} is non-finite, skipping backward")
+                loss_send[0] = loss_val
+                dist.send(loss_send, dst=0)
+                global_step += 1
+                continue
+
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-            optimizer.step()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            # Guard: skip optimizer step if gradients are NaN
+            if not torch.isfinite(grad_norm):
+                log.warning(f"step {global_step}: grad_norm={grad_norm.item():.4f} non-finite, skipping optimizer step")
+                optimizer.zero_grad()
+            else:
+                optimizer.step()
             scheduler.step()
             train_t = time.perf_counter() - t0
 
-            loss_val = loss.item()
             losses.append(loss_val)
 
             # Send loss back to producer

@@ -177,24 +177,16 @@ spec:
             echo "  hostname: $(hostname)"
             echo "  MASTER_ADDR: ${MASTER_ADDR}  MASTER_PORT: ${MASTER_PORT}"
             nvidia-smi -L
-
-            echo "=== [setup] rsyncing speculators source from producer ==="
-            mkdir -p /tmp/speculators
-            rsync -avP --exclude='.git' --exclude='__pycache__' --exclude='*.egg-info' \
-              host-10-83-115-10:/root/work/speculators/ /tmp/speculators/ 2>&1 | tail -5
-
-            echo "=== [setup] installing speculators ==="
-            pip install -e /tmp/speculators[training] --quiet --no-build-isolation 2>&1 | tail -3
-
-            echo "=== [setup] rsyncing Eagle3 checkpoint from producer ==="
-            mkdir -p /tmp/eagle3_ckpt_p3
-            rsync -avP host-10-83-115-10:/data/training/eagle3_v2_apilog/7/ /tmp/eagle3_ckpt_p3/ 2>&1 | tail -5
-
-            echo "=== [setup] rsyncing vocab mapping from producer ==="
-            mkdir -p /tmp/vocab_p3
-            rsync -avP host-10-83-115-10:/data/datasets/apilog_k25_eagle3/vocab_mapping/ /tmp/vocab_p3/ 2>&1 | tail -3
-
-            echo "=== [setup] done — launching torchrun ==="
+            echo "=== speculators version ==="
+            python3 -c "import speculators; print(speculators.__version__)" || true
+            echo "=== waiting for producer torchrun rendezvous on ${MASTER_ADDR}:${MASTER_PORT} ==="
+            until (echo > /dev/tcp/${MASTER_ADDR}/${MASTER_PORT}) 2>/dev/null; do
+              printf "."; sleep 3
+            done
+            echo " port open — launching torchrun"
+            echo "=== installing speculators from source ==="
+            pip install -e /workspace/speculators[training] --quiet --no-build-isolation 2>&1 | tail -3
+            echo "=== launching torchrun ==="
             torchrun \
               --nnodes=2 \
               --nproc_per_node=1 \
@@ -212,15 +204,13 @@ spec:
           - name: P2P_NCCL_PORT
             value: "29503"
           - name: EAGLE3_CKPT_DIR
-            value: "/tmp/eagle3_ckpt_p3"
+            value: "/data/training/eagle3_v2_apilog/7"
           - name: EAGLE3_VOCAB_DIR
-            value: "/tmp/vocab_p3"
+            value: "/data/training/vocab_mapping_p3"
           - name: EAGLE3_OUT_DIR
             value: "/data/training/eagle3_v3_online"
           - name: K2_5_MODEL_PATH
             value: "/data/models/Kimi-K2.5"
-          - name: SPECULATORS_PATH
-            value: "/tmp/speculators/src"
           - name: NCCL_SOCKET_IFNAME
             value: "b_manage0"
           - name: GLOO_SOCKET_IFNAME
@@ -248,6 +238,8 @@ spec:
             readOnly: true
           - name: training
             mountPath: /data/training
+          - name: speculators
+            mountPath: /workspace/speculators
           - name: dshm
             mountPath: /dev/shm
           - name: infiniband
@@ -264,6 +256,10 @@ spec:
           hostPath:
             path: /data/training
             type: DirectoryOrCreate
+        - name: speculators
+          hostPath:
+            path: /root/work/speculators
+            type: Directory
         - name: dshm
           emptyDir:
             medium: Memory
