@@ -23,7 +23,6 @@ Transfer protocol (producer → consumer, fixed MAX_SEQ_LEN=2048):
 """
 
 import os
-import re
 import sys
 import time
 import json
