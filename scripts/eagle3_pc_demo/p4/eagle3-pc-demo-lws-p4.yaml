@@ -1,7 +1,7 @@
 ##
 # EAGLE3 Producer-Consumer POC — Phase 4
 # Key improvements over Phase 3:
-#   - Dataset: apilog_k25_eagle3/train/ (5761 files, 4096 seq_len) — same as offline training
+#   - Dataset: apilog_k25_eagle3/train_40k_greedy_v2/ (29K files, variable seq_len)
 #   - MAX_SEQ_LEN: 4096 (was 2048) — no more sequence truncation
 #   - NaN scrubbing on producer side — eliminates consumer NaN skips
 #   - Starting checkpoint: Phase 2 epoch 7 (71.4% val acc baseline)
@@ -9,7 +9,7 @@
 #
 # Producer (rank 0 / leader): host-10-83-115-10, 8 GPUs
 #   - K2.5 TP=8 via VllmHiddenStatesGenerator (max_model_len=4096)
-#   - Reads .pt files from /data/datasets/apilog_k25_eagle3/train/ (5761 files)
+#   - Reads .pt files from /data/datasets/apilog_k25_eagle3/train_40k_greedy_v2/ (29K files)
 #   - NaN scrubbing applied before send
 #
 # Consumer (rank 1 / worker): host-10-83-115-14, 1 GPU

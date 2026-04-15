@@ -2,7 +2,7 @@
 EAGLE3 Producer-Consumer Phase 4 — Producer (youyun.37 / host-10-83-115-10)
 
 Key improvements over Phase 3:
-  - Dataset: apilog_k25_eagle3/train/ (5761 files, 4096 seq_len) — same as offline training
+  - Dataset: apilog_k25_eagle3/train_40k_greedy_v2/ (29K files, variable seq_len)
   - MAX_SEQ_LEN: 4096 (was 2048 in Phase 3) — no more sequence truncation
   - NaN scrubbing: nan_to_num applied before send (eliminates consumer NaN skips)
   - Length mismatch tolerance relaxed: allow up to ±2 tokens
@@ -42,7 +42,7 @@ log = logging.getLogger(__name__)
 # ---- Config ----
 MODEL_PATH   = "/data/models/Kimi-K2.5"
 LAYER_IDS    = [2, 30, 58, 60]
-DATA_DIR     = "/data/datasets/apilog_k25_eagle3/train"   # 5761 files, 4096 seq_len (matches offline)
+DATA_DIR     = "/data/datasets/apilog_k25_eagle3/train_40k_greedy_v2"  # 29K files, variable seq_len
 MAX_SEQ_LEN  = 4096
 H            = 7168
 NUM_EPOCHS   = 3
