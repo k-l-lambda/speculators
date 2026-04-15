@@ -263,7 +263,7 @@ spec:
         - name: training
           hostPath:
             path: /data/training
-            type: Directory
+            type: DirectoryOrCreate
         - name: dshm
           emptyDir:
             medium: Memory
