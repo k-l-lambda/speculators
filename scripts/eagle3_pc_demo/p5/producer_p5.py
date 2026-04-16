@@ -248,8 +248,11 @@ def main():
             #  producer sends data to rank 1 while rank 1 is in AllReduce waiting for
             #  ranks 2-8 who haven't gotten meta yet -> deadlock)
             for consumer_rank, seq_len, aux_hs, last_hs, ids_t, mask_t in payloads:
+                log.info(f'[dbg] Phase1: sending meta to rank {consumer_rank}')
                 meta_send[0] = seq_len
                 dist.send(meta_send, dst=consumer_rank)
+                log.info(f'[dbg] Phase1: meta sent to rank {consumer_rank} OK')
+            log.info('[dbg] Phase1 done, starting Phase2 isends')
 
             # Phase 2: Send ALL data simultaneously using async isend.
             # Sequential dist.send caused rank-1 to enter NaN AllReduce while ranks 2-8
@@ -267,13 +270,18 @@ def main():
                 isend_works.append(dist.isend(mask_t,   dst=consumer_rank))
                 total_sent_bytes += (aux_hs.nbytes + last_hs.nbytes +
                                      ids_t.nbytes + mask_t.nbytes)
-            for work in isend_works:
+            log.info(f'[dbg] Phase2: submitted {len(isend_works)} isends, waiting for all...')
+            for wi, work in enumerate(isend_works):
                 work.wait()
+                log.info(f'[dbg] Phase2: isend[{wi}] wait done')
+            log.info('[dbg] Phase2 all isends done')
 
             send_t = time.perf_counter() - t0
 
             # Receive loss from consumer rank 1 (DDP rank 0)
+            log.info('[dbg] calling dist.recv(loss) from rank 1')
             dist.recv(loss_recv, src=1)
+            log.info(f'[dbg] loss received: {loss_recv.item():.4f}')
             total_t = time.perf_counter() - t0
 
             if global_round >= WARMUP_STEPS:
