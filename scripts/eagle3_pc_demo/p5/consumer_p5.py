@@ -311,6 +311,7 @@ def main():
             lengths = torch.tensor([seq_len], dtype=torch.long, device=device)
 
             optimizer.zero_grad()
+            log.info(f'[dbg] rank={dist.get_rank()} starting model forward')
             _draft_tokens, loss, metrics = model(
                 hidden_states=aux_buf.float(),
                 input_ids=ids_buf,
@@ -321,13 +322,16 @@ def main():
                 ttt_step_loss_decay=TTT_DECAY,
             )
             # DDP backward: auto AllReduce gradients across consumer ranks via NVLink
+            log.info(f'[dbg] rank={dist.get_rank()} model forward done')
 
             loss_val = loss.item()
             # Coordinate non-finite loss skip across ALL DDP ranks to avoid AllReduce deadlock
             nonfinite_flag = torch.zeros(1, dtype=torch.int32, device=device)
             if not torch.isfinite(loss):
                 nonfinite_flag[0] = 1
+            log.info(f'[dbg] rank={dist.get_rank()} entering nonfinite AllReduce')
             dist.all_reduce(nonfinite_flag, op=dist.ReduceOp.MAX, group=ddp_group)
+            log.info(f'[dbg] rank={dist.get_rank()} nonfinite AllReduce done, flag={nonfinite_flag.item()}')
             if nonfinite_flag.item() > 0:
                 log.warning(f"step {global_step}: loss={loss_val} non-finite (any rank), skipping backward")
                 if is_chief:
@@ -336,7 +340,9 @@ def main():
                 global_step += 1
                 continue
 
+            log.info(f'[dbg] rank={dist.get_rank()} calling loss.backward()')
             loss.backward()
+            log.info(f'[dbg] rank={dist.get_rank()} loss.backward() done')
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             if not torch.isfinite(grad_norm):
                 log.warning(f"step {global_step}: grad_norm non-finite, skipping optimizer step")
@@ -349,7 +355,9 @@ def main():
             if is_chief:
                 losses.append(loss_val)
                 loss_send[0] = loss_val
+                log.info(f'[dbg] rank={dist.get_rank()} sending loss={loss_val:.4f} to producer')
                 dist.send(loss_send, dst=0)
+                log.info(f'[dbg] rank={dist.get_rank()} loss sent OK')
 
             if global_step % LOG_INTERVAL == 0 and is_chief:
                 lr_now = optimizer.param_groups[0]["lr"]
