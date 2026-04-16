@@ -211,9 +211,11 @@ spec:
           - name: P2P_NCCL_PORT
             value: "29503"
           - name: EAGLE3_CKPT_DIR
-            value: "/data/training/eagle3_v2_apilog/7"
+            value: "/data/training/eagle3_v4_online/70500"
           - name: EAGLE3_VOCAB_DIR
             value: "/data/training/eagle3_v2_apilog/7"
+          - name: GLOBAL_STEP_OFFSET
+            value: "70500"
           - name: EAGLE3_OUT_DIR
             value: "/data/training/eagle3_v4_online"
           - name: K2_5_MODEL_PATH

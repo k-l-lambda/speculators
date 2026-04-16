@@ -37,10 +37,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---- Config ----
-CKPT_IN_DIR    = os.environ.get("EAGLE3_CKPT_DIR",   "/data/training/eagle3_v2_apilog/7")
-VOCAB_DIR      = os.environ.get("EAGLE3_VOCAB_DIR",  "/data/training/eagle3_v2_apilog/7")
-CKPT_OUT_DIR   = os.environ.get("EAGLE3_OUT_DIR",    "/data/training/eagle3_v4_online")
-K2_5_PATH      = os.environ.get("K2_5_MODEL_PATH",   "/data/models/Kimi-K2.5")
+CKPT_IN_DIR        = os.environ.get("EAGLE3_CKPT_DIR",      "/data/training/eagle3_v2_apilog/7")
+VOCAB_DIR          = os.environ.get("EAGLE3_VOCAB_DIR",     "/data/training/eagle3_v2_apilog/7")
+CKPT_OUT_DIR       = os.environ.get("EAGLE3_OUT_DIR",       "/data/training/eagle3_v4_online")
+K2_5_PATH          = os.environ.get("K2_5_MODEL_PATH",      "/data/models/Kimi-K2.5")
+GLOBAL_STEP_OFFSET = int(os.environ.get("GLOBAL_STEP_OFFSET", "0"))
 
 H              = 7168
 MAX_SEQ_LEN    = 4096
@@ -202,6 +203,23 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda_fn)
 
+    # Resume optimizer/scheduler from checkpoint if GLOBAL_STEP_OFFSET > 0
+    if GLOBAL_STEP_OFFSET > 0:
+        opt_path = Path(CKPT_IN_DIR) / "optimizer_state_dict.pt"
+        sch_path = Path(CKPT_IN_DIR) / "scheduler_state_dict.pt"
+        if opt_path.exists():
+            optimizer.load_state_dict(torch.load(str(opt_path), map_location=device))
+            log.info(f"Optimizer state loaded from {opt_path}")
+        else:
+            log.warning(f"No optimizer state at {opt_path}, starting fresh (LR warmup skipped)")
+            # Fast-forward scheduler to correct LR without optimizer momentum
+            for _ in range(GLOBAL_STEP_OFFSET):
+                scheduler.step()
+        if sch_path.exists() and opt_path.exists():
+            scheduler.load_state_dict(torch.load(str(sch_path), map_location="cpu"))
+            log.info(f"Scheduler state loaded from {sch_path}")
+        log.info(f"Resuming from global_step={GLOBAL_STEP_OFFSET}")
+
     wait_for_producer_ready(master_addr, sync_port=SYNC_PORT)
 
     log.info(f"Init P2P dist group: rank=1 world=2 addr={master_addr}:{P2P_PORT}")
@@ -232,7 +250,7 @@ def main():
     Path(CKPT_OUT_DIR).mkdir(parents=True, exist_ok=True)
 
     losses = []
-    global_step = 0
+    global_step = GLOBAL_STEP_OFFSET
 
     try:
         while True:
