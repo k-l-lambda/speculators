@@ -161,7 +161,7 @@ def main():
     dist.init_process_group(
         backend="nccl", rank=0, world_size=world_size,
         init_method=f"tcp://{master_addr}:{P2P_PORT}",
-        timeout=timedelta(minutes=5),
+        timeout=timedelta(hours=2),
     )
     log.info("P2P dist group initialized")
 

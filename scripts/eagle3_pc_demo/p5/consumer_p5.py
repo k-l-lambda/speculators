@@ -281,9 +281,13 @@ def main():
 
             nb = aux_buf.nbytes + last_buf.nbytes + ids_buf.nbytes + mask_buf.nbytes
 
-            # NaN guard
+            # NaN guard — coordinate skip across ALL DDP ranks to avoid AllReduce deadlock
+            nan_flag = torch.zeros(1, dtype=torch.int32, device=device)
             if not (torch.isfinite(aux_buf).all() and torch.isfinite(last_buf).all()):
-                log.warning(f"step {global_step}: NaN/Inf in received hidden states, skipping")
+                nan_flag[0] = 1
+            dist.all_reduce(nan_flag, op=dist.ReduceOp.MAX, group=ddp_group)
+            if nan_flag.item() > 0:
+                log.warning(f"step {global_step}: NaN/Inf in hidden states (any rank), skipping")
                 if is_chief:
                     loss_send[0] = float('nan')
                     dist.send(loss_send, dst=0)
@@ -305,8 +309,13 @@ def main():
             # DDP backward: auto AllReduce gradients across consumer ranks via NVLink
 
             loss_val = loss.item()
+            # Coordinate non-finite loss skip across ALL DDP ranks to avoid AllReduce deadlock
+            nonfinite_flag = torch.zeros(1, dtype=torch.int32, device=device)
             if not torch.isfinite(loss):
-                log.warning(f"step {global_step}: loss={loss_val} non-finite, skipping backward")
+                nonfinite_flag[0] = 1
+            dist.all_reduce(nonfinite_flag, op=dist.ReduceOp.MAX, group=ddp_group)
+            if nonfinite_flag.item() > 0:
+                log.warning(f"step {global_step}: loss={loss_val} non-finite (any rank), skipping backward")
                 if is_chief:
                     loss_send[0] = loss_val
                     dist.send(loss_send, dst=0)
