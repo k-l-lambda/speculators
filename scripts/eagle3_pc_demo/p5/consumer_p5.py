@@ -262,13 +262,10 @@ def main():
             dist.recv(meta_recv, src=0)
             seq_len = int(meta_recv[0].item())
 
-            # Skip sentinel — coordinate across ALL DDP ranks to avoid AllReduce deadlock
-            skip_flag = torch.zeros(1, dtype=torch.int32, device=device)
+            # Skip sentinel — producer guarantees all-or-nothing (all ranks same decision)
+            # so direct check is safe: all 8 ranks will take same branch, no DDP desync
             if seq_len == -1:
-                skip_flag[0] = 1
-            dist.all_reduce(skip_flag, op=dist.ReduceOp.MAX, group=ddp_group)
-            if skip_flag.item() > 0:
-                log.info(f'step {global_step}: skip sentinel received (any rank), coordinating skip')
+                log.info(f'step {global_step}: skip sentinel')
                 if is_chief:
                     loss_send[0] = float('nan')
                     dist.send(loss_send, dst=0)
