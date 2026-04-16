@@ -1,0 +1,290 @@
+##
+# EAGLE3 Producer-Consumer POC — Phase 5
+# Key improvements over Phase 4:
+#   - Producer: batch=8 (K2.5 generates 8 sequences per round)
+#   - Consumer: DP=8 via DDP (all 8 H200s on host-10-83-115-14)
+#   - Variable-size transfer: sends actual seq_len tensors (not padded to 4096)
+#     avg 8×25 MB = 200 MB/round vs 8×224 MB = 1792 MB (padded)
+#   - Expected throughput: 4.5 seq/s vs 0.83 seq/s in Phase 4 (~5.4×)
+#   - world_size=9: rank 0 (producer) + ranks 1-8 (consumers)
+#
+# Producer (rank 0 / leader): host-10-83-115-10, 8 GPUs
+#   - K2.5 TP=8, batch=8, gpu_memory_utilization=0.75
+#   - Sends to 8 consumer ranks sequentially (actual seq_len, no padding)
+#
+# Consumer (ranks 1-8 / worker): host-10-83-115-14, 8 GPUs
+#   - torchrun --nproc_per_node=8
+#   - DDP via DistributedDataParallel + NVLink AllReduce
+#   - Each GPU receives 1 sequence independently from producer
+#   - Only local_rank=0 saves checkpoints and sends loss to producer
+#   - Checkpoints → /data/training/eagle3_v5_online/
+#
+# Port map (unchanged from Phase 4):
+#   MASTER_PORT=29500   → torchrun rendezvous
+#   SYNC_PORT=29501     → TCP "ready" signal (producer → 8 consumers)
+#   VLLM_PORT=29502     → vLLM TP group
+#   P2P_NCCL_PORT=29503 → P2P NCCL group (world_size=9)
+#
+# Usage:
+#   cd /root/work/speculators/scripts/eagle3_pc_demo/p5/
+#   kubectl apply -f eagle3-pc-demo-lws-p5.yaml
+#   kubectl create configmap eagle3-pc-demo-p5-scripts \
+#     --from-file=producer_p5.py=producer_p5.py \
+#     --from-file=consumer_p5.py=consumer_p5.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# Monitor:
+#   kubectl logs -f eagle3-pc-demo-p5-0    # producer
+#   kubectl logs -f eagle3-pc-demo-p5-0-1  # consumer (all 8 ranks merged)
+#
+# Cleanup:
+#   kubectl delete lws eagle3-pc-demo-p5
+#   kubectl delete configmap eagle3-pc-demo-p5-scripts
+#
+# On crash: always delete BOTH pods simultaneously to avoid rendezvous deadlock:
+#   kubectl delete pod eagle3-pc-demo-p5-0 eagle3-pc-demo-p5-0-1
+##
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eagle3-pc-demo-p5-scripts
+  namespace: default
+data:
+  producer_p5.py: |
+    # Placeholder — inject real scripts after apply:
+    # kubectl create configmap eagle3-pc-demo-p5-scripts \
+    #   --from-file=producer_p5.py=producer_p5.py \
+    #   --from-file=consumer_p5.py=consumer_p5.py \
+    #   --dry-run=client -o yaml | kubectl apply -f -
+    raise NotImplementedError("deploy with kubectl create configmap as shown in yaml header")
+
+  consumer_p5.py: |
+    # Placeholder — see above
+
+---
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: eagle3-pc-demo-p5
+  namespace: default
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: None
+    leaderTemplate:
+      metadata:
+        labels:
+          role: producer
+          app: eagle3-pc-demo-p5
+      spec:
+        nodeName: host-10-83-115-10
+        hostNetwork: true
+        containers:
+        - name: worker
+          image: docker.io/library/speculators:v0.17.0
+          imagePullPolicy: Never
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            set -e
+            echo "=== EAGLE3 PC Demo Phase 5 — PRODUCER ==="
+            echo "  hostname: $(hostname)"
+            echo "  MASTER_ADDR: ${MASTER_ADDR}  MASTER_PORT: ${MASTER_PORT}"
+            nvidia-smi -L
+            echo "=== installing speculators from source ==="
+            pip install -e /workspace/speculators[training] --quiet --no-build-isolation 2>&1 | tail -3
+            echo "=== launching torchrun ==="
+            torchrun \
+              --nnodes=2 \
+              --nproc_per_node=1 \
+              --node_rank=0 \
+              --master_addr=${MASTER_ADDR} \
+              --master_port=${MASTER_PORT} \
+              /scripts/producer_p5.py
+            echo "=== PRODUCER DONE ==="
+            tail -f /dev/null
+          env:
+          - name: MASTER_ADDR
+            value: "10.83.115.10"
+          - name: MASTER_PORT
+            value: "29500"
+          - name: VLLM_MASTER_PORT
+            value: "29502"
+          - name: P2P_NCCL_PORT
+            value: "29503"
+          - name: BATCH_SIZE
+            value: "8"
+          - name: CONSUMER_DDP_SIZE
+            value: "8"
+          - name: NCCL_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: GLOO_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: NCCL_IB_DISABLE
+            value: "0"
+          - name: NCCL_IB_GID_INDEX
+            value: "3"
+          - name: HF_HUB_OFFLINE
+            value: "1"
+          - name: TRANSFORMERS_OFFLINE
+            value: "1"
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+            requests:
+              nvidia.com/gpu: "8"
+          volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+          - name: speculators
+            mountPath: /workspace/speculators
+          - name: models
+            mountPath: /data/models
+            readOnly: true
+          - name: datasets
+            mountPath: /data/datasets
+            readOnly: true
+          - name: dshm
+            mountPath: /dev/shm
+          - name: infiniband
+            mountPath: /dev/infiniband
+        volumes:
+        - name: scripts
+          configMap:
+            name: eagle3-pc-demo-p5-scripts
+        - name: speculators
+          hostPath:
+            path: /root/work/speculators
+            type: Directory
+        - name: models
+          hostPath:
+            path: /data/models
+            type: Directory
+        - name: datasets
+          hostPath:
+            path: /data/datasets
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: Directory
+    workerTemplate:
+      metadata:
+        labels:
+          role: consumer
+          app: eagle3-pc-demo-p5
+      spec:
+        nodeName: host-10-83-115-14
+        hostNetwork: true
+        containers:
+        - name: worker
+          image: docker.io/library/speculators:v0.17.0
+          imagePullPolicy: Never
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            set -e
+            echo "=== EAGLE3 PC Demo Phase 5 — CONSUMER (DP=8) ==="
+            echo "  hostname: $(hostname)"
+            echo "  MASTER_ADDR: ${MASTER_ADDR}  MASTER_PORT: ${MASTER_PORT}"
+            nvidia-smi -L
+            echo "=== installing speculators from source ==="
+            pip install -e /workspace/speculators[training] --quiet --no-build-isolation 2>&1 | tail -3
+            echo "=== waiting for producer torchrun rendezvous on ${MASTER_ADDR}:${MASTER_PORT} ==="
+            until (echo > /dev/tcp/${MASTER_ADDR}/${MASTER_PORT}) 2>/dev/null; do
+              printf "."; sleep 3
+            done
+            echo " port open — launching torchrun (8 ranks)"
+            echo "=== launching torchrun ==="
+            torchrun \
+              --nnodes=2 \
+              --nproc_per_node=8 \
+              --node_rank=1 \
+              --master_addr=${MASTER_ADDR} \
+              --master_port=${MASTER_PORT} \
+              /scripts/consumer_p5.py
+            echo "=== CONSUMER DONE ==="
+            tail -f /dev/null
+          env:
+          - name: MASTER_ADDR
+            value: "10.83.115.10"
+          - name: MASTER_PORT
+            value: "29500"
+          - name: P2P_NCCL_PORT
+            value: "29503"
+          - name: EAGLE3_CKPT_DIR
+            value: "/data/training/eagle3_v2_apilog/7"
+          - name: EAGLE3_VOCAB_DIR
+            value: "/data/training/eagle3_v2_apilog/7"
+          - name: GLOBAL_STEP_OFFSET
+            value: "0"
+          - name: EAGLE3_OUT_DIR
+            value: "/data/training/eagle3_v5_online"
+          - name: K2_5_MODEL_PATH
+            value: "/data/models/Kimi-K2.5"
+          - name: CONSUMER_DDP_SIZE
+            value: "8"
+          - name: NCCL_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: GLOO_SOCKET_IFNAME
+            value: "b_manage0"
+          - name: NCCL_IB_DISABLE
+            value: "1"
+          - name: NCCL_IB_GID_INDEX
+            value: "3"
+          - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+            value: "0"
+          - name: HF_HUB_OFFLINE
+            value: "1"
+          - name: TRANSFORMERS_OFFLINE
+            value: "1"
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+            requests:
+              nvidia.com/gpu: "8"
+          volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+          - name: speculators
+            mountPath: /workspace/speculators
+          - name: models
+            mountPath: /data/models
+            readOnly: true
+          - name: training
+            mountPath: /data/training
+          - name: dshm
+            mountPath: /dev/shm
+          - name: infiniband
+            mountPath: /dev/infiniband
+        volumes:
+        - name: scripts
+          configMap:
+            name: eagle3-pc-demo-p5-scripts
+        - name: speculators
+          hostPath:
+            path: /root/work/speculators
+            type: Directory
+        - name: models
+          hostPath:
+            path: /data/models
+            type: Directory
+        - name: training
+          hostPath:
+            path: /data/training
+            type: DirectoryOrCreate
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: infiniband
+          hostPath:
+            path: /dev/infiniband
+            type: Directory
