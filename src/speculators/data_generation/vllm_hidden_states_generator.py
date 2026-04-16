@@ -286,7 +286,9 @@ class VllmHiddenStatesGenerator:
         # Increment to ensure unique request IDs across calls
         # (prevents KV cache corruption with delayed block freeing)
         self._request_counter += 1
+        log.info(f"[gen dbg] calling _reset_capture (counter={self._request_counter})")
         self.executor.collective_rpc("_reset_capture")
+        log.info("[gen dbg] _reset_capture done")
 
         # Track progress for each request to distinguish prefill from decode
         request_num_computed = dict.fromkeys(request_id_to_idx, 0)
@@ -294,9 +296,12 @@ class VllmHiddenStatesGenerator:
         all_prefill_complete = False
 
         while (
+            log.info(f"[gen dbg] calling schedule() iter={schedule_iterations}") or True
+        ) and (
             scheduler_output := self.scheduler.schedule()
         ).total_num_scheduled_tokens > 0 and not all_prefill_complete:
             schedule_iterations += 1
+            log.info(f"[gen dbg] scheduled {scheduler_output.total_num_scheduled_tokens} tokens")
 
             # Calculate prefill tokens for each request (ignore decode tokens)
             prefill_metadata = {}
@@ -316,23 +321,34 @@ class VllmHiddenStatesGenerator:
             )
 
             if prefill_metadata:
+                log.info(f"[gen dbg] calling _set_request_metadata")
                 self.executor.collective_rpc(
                     "_set_request_metadata", args=(prefill_metadata,)
                 )
+                log.info("[gen dbg] _set_request_metadata done")
 
+            log.info(f"[gen dbg] calling execute_model iter={schedule_iterations}")
             model_output = self.executor.execute_model(scheduler_output)
+            log.info(f"[gen dbg] execute_model done iter={schedule_iterations}")
+            log.info(f"[gen dbg] calling sample_tokens iter={schedule_iterations}")
             self.executor.sample_tokens(model_output)
+            log.info(f"[gen dbg] sample_tokens done iter={schedule_iterations}")
 
+        log.info(f"[gen dbg] loop done after {schedule_iterations} iters, calling finish_requests")
         # Abort all requests (prefill complete, don't need decode)
         self.scheduler.finish_requests(
             list(request_id_to_idx.keys()), RequestStatus.FINISHED_ABORTED
         )
 
+        log.info("[gen dbg] calling _get_captured_states")
         # Get captured states organized by request ID
+        # timeout=300s to get a TimeoutError instead of infinite hang
         request_states_dict = self.executor.collective_rpc(
             "_get_captured_states",
             unique_reply_rank=0,
+            timeout=300.0,
         )
+        log.info(f"[gen dbg] _get_captured_states done, got {len(request_states_dict) if request_states_dict else 0} requests")
 
         if not request_states_dict:
             raise RuntimeError("Failed to capture hidden states from worker")

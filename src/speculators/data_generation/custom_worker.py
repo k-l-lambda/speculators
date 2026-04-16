@@ -162,20 +162,36 @@ class HiddenStatesWorkerExtension:
         """Get the captured hidden states organized by request ID.
 
         Returns:
-            Dict mapping request_id to list of tensors (one per layer),
+            Dict mapping request_id to list of CPU tensors (one per layer),
             or None if no states captured.
 
         Track which tokens belong to which request across chunked prefill iterations.
+        Tensors are moved to CPU before returning to avoid CUDA IPC serialization
+        issues when passing results through the multiproc response queue.
         """
+        import time as _time
+        t0 = _time.monotonic()
+        rank = get_tp_group().rank_in_group
+        logger.info(f"[_get_captured_states rank={rank}] enter")
+
         if self._captured_states is None:
+            logger.info(f"[_get_captured_states rank={rank}] no captured states, returning None")
             return None
 
+        n_layers = len(self._captured_states)
+        n_iters = len(self._captured_states[0])
+        total_toks = sum(t.shape[0] for t in self._captured_states[0])
+        logger.info(f"[_get_captured_states rank={rank}] {n_layers} layers, {n_iters} iters, {total_toks} total tokens")
+
         # Concatenate captured states from all scheduler iterations
+        t1 = _time.monotonic()
         concatenated_layers = [
             torch.cat(layer_tensors, dim=0) for layer_tensors in self._captured_states
         ]
+        logger.info(f"[_get_captured_states rank={rank}] torch.cat done in {_time.monotonic()-t1:.3f}s, shape={concatenated_layers[0].shape}")
 
         # Slice and group by request
+        t2 = _time.monotonic()
         request_chunks: defaultdict[str, list[list[torch.Tensor]]] = defaultdict(
             lambda: [[] for _ in range(len(concatenated_layers))]
         )
@@ -187,12 +203,15 @@ class HiddenStatesWorkerExtension:
                     chunk = layer_tensor[current_idx : current_idx + num_tok].clone()
                     request_chunks[req_id][layer_idx].append(chunk)
                 current_idx += num_tok
+        logger.info(f"[_get_captured_states rank={rank}] slicing done in {_time.monotonic()-t2:.3f}s")
 
-        # Concatenate chunks for each request
+        # Concatenate chunks for each request, move to CPU to avoid CUDA IPC issues
+        t3 = _time.monotonic()
         result: dict[str, list[torch.Tensor]] = {
-            req_id: [torch.cat(chunks, dim=0) for chunks in layer_chunks]
+            req_id: [torch.cat(chunks, dim=0).cpu() for chunks in layer_chunks]
             for req_id, layer_chunks in request_chunks.items()
         }
+        logger.info(f"[_get_captured_states rank={rank}] cpu transfer done in {_time.monotonic()-t3:.3f}s, {len(result)} requests, total={_time.monotonic()-t0:.3f}s")
 
         # Clear intermediate storage
         self._captured_states = None  # type: ignore[assignment]
