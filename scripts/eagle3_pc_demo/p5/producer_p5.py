@@ -243,11 +243,17 @@ def main():
                 global_round += 1
                 continue
 
-            # Send real data to each consumer rank
-            total_sent_bytes = 0
+            # Phase 1: Send ALL metas first so all consumer ranks can do skip_flag AllReduce
+            # (consumer AllReduces between meta-recv and data-recv; without this split,
+            #  producer sends data to rank 1 while rank 1 is in AllReduce waiting for
+            #  ranks 2-8 who haven't gotten meta yet -> deadlock)
             for consumer_rank, seq_len, aux_hs, last_hs, ids_t, mask_t in payloads:
                 meta_send[0] = seq_len
                 dist.send(meta_send, dst=consumer_rank)
+
+            # Phase 2: Send data tensors (all consumers now past skip_flag AllReduce)
+            total_sent_bytes = 0
+            for consumer_rank, seq_len, aux_hs, last_hs, ids_t, mask_t in payloads:
                 dist.send(aux_hs,    dst=consumer_rank)   # [1, seq_len, 3H]
                 dist.send(last_hs,   dst=consumer_rank)   # [1, seq_len, H]
                 dist.send(ids_t,     dst=consumer_rank)
