@@ -259,8 +259,10 @@ def main():
 
             # Receive seq_len first
             meta_recv = torch.zeros(1, dtype=torch.int64, device=device)
+            log.info(f'[dbg] rank={dist.get_rank()} waiting for meta')
             dist.recv(meta_recv, src=0)
             seq_len = int(meta_recv[0].item())
+            log.info(f'[dbg] rank={dist.get_rank()} got meta seq_len={seq_len}')
 
             # Skip sentinel — producer guarantees all-or-nothing (all ranks same decision)
             # so direct check is safe: all 8 ranks will take same branch, no DDP desync
@@ -278,10 +280,15 @@ def main():
             ids_buf  = torch.empty(1, seq_len,        dtype=torch.int64,    device=device)
             mask_buf = torch.empty(1, seq_len,        dtype=torch.float32,  device=device)
 
+            log.info(f'[dbg] rank={dist.get_rank()} entering data recvs seq_len={seq_len}')
             dist.recv(aux_buf,  src=0)
+            log.info(f'[dbg] rank={dist.get_rank()} aux_buf received')
             dist.recv(last_buf, src=0)
+            log.info(f'[dbg] rank={dist.get_rank()} last_buf received')
             dist.recv(ids_buf,  src=0)
+            log.info(f'[dbg] rank={dist.get_rank()} ids_buf received')
             dist.recv(mask_buf, src=0)
+            log.info(f'[dbg] rank={dist.get_rank()} mask_buf received')
             recv_t = time.perf_counter() - t0
 
             nb = aux_buf.nbytes + last_buf.nbytes + ids_buf.nbytes + mask_buf.nbytes
@@ -290,7 +297,9 @@ def main():
             nan_flag = torch.zeros(1, dtype=torch.int32, device=device)
             if not (torch.isfinite(aux_buf).all() and torch.isfinite(last_buf).all()):
                 nan_flag[0] = 1
+            log.info(f'[dbg] rank={dist.get_rank()} entering nan AllReduce')
             dist.all_reduce(nan_flag, op=dist.ReduceOp.MAX, group=ddp_group)
+            log.info(f'[dbg] rank={dist.get_rank()} nan AllReduce done, nan_flag={nan_flag.item()}')
             if nan_flag.item() > 0:
                 log.warning(f"step {global_step}: NaN/Inf in hidden states (any rank), skipping")
                 if is_chief:
