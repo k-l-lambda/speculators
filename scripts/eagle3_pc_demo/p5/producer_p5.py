@@ -251,16 +251,23 @@ def main():
                 meta_send[0] = seq_len
                 dist.send(meta_send, dst=consumer_rank)
 
-            # Phase 2: Send data tensors (all consumers now past skip_flag AllReduce)
+            # Phase 2: Send ALL data simultaneously to avoid AllReduce deadlock.
+            # Sequential sends caused rank-1 to enter NaN AllReduce while ranks 2-8
+            # were still in P2P recv → all GPUs spin at 100% SM indefinitely.
+            # Fix: batch_isend_irecv submits all sends at once so all ranks finish
+            # receiving at ~the same time and enter AllReduce together.
             total_sent_bytes = 0
+            p2p_ops = []
             for consumer_rank, seq_len, aux_hs, last_hs, ids_t, mask_t in payloads:
-                dist.send(aux_hs,    dst=consumer_rank)   # [1, seq_len, 3H]
-                dist.send(last_hs,   dst=consumer_rank)   # [1, seq_len, H]
-                dist.send(ids_t,     dst=consumer_rank)
-                dist.send(mask_t,    dst=consumer_rank)
-
+                p2p_ops.append(dist.P2POp(dist.isend, aux_hs,   consumer_rank))
+                p2p_ops.append(dist.P2POp(dist.isend, last_hs,  consumer_rank))
+                p2p_ops.append(dist.P2POp(dist.isend, ids_t,    consumer_rank))
+                p2p_ops.append(dist.P2POp(dist.isend, mask_t,   consumer_rank))
                 total_sent_bytes += (aux_hs.nbytes + last_hs.nbytes +
                                      ids_t.nbytes + mask_t.nbytes)
+            works = dist.batch_isend_irecv(p2p_ops)
+            for work in works:
+                work.wait()
 
             send_t = time.perf_counter() - t0
 
