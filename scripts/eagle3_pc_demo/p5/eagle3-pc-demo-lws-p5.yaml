@@ -241,6 +241,8 @@ spec:
             value: "3"
           - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
             value: "0"
+          - name: TORCHDYNAMO_DISABLE
+            value: "1"
           - name: HF_HUB_OFFLINE
             value: "1"
           - name: TRANSFORMERS_OFFLINE
