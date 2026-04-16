@@ -251,22 +251,23 @@ def main():
                 meta_send[0] = seq_len
                 dist.send(meta_send, dst=consumer_rank)
 
-            # Phase 2: Send ALL data simultaneously to avoid AllReduce deadlock.
-            # Sequential sends caused rank-1 to enter NaN AllReduce while ranks 2-8
-            # were still in P2P recv → all GPUs spin at 100% SM indefinitely.
-            # Fix: batch_isend_irecv submits all sends at once so all ranks finish
-            # receiving at ~the same time and enter AllReduce together.
+            # Phase 2: Send ALL data simultaneously using async isend.
+            # Sequential dist.send caused rank-1 to enter NaN AllReduce while ranks 2-8
+            # were still in P2P recv → NCCL GPU-level deadlock (100% SM, 0% mem BW).
+            # Fix: submit all isend ops BEFORE any wait() so all 8 consumer ranks
+            # receive data in parallel and enter AllReduce together.
+            # Note: do NOT use batch_isend_irecv — it requires consumer to also use
+            # batch_isend_irecv (symmetric), which would require rewriting consumer.
             total_sent_bytes = 0
-            p2p_ops = []
+            isend_works = []
             for consumer_rank, seq_len, aux_hs, last_hs, ids_t, mask_t in payloads:
-                p2p_ops.append(dist.P2POp(dist.isend, aux_hs,   consumer_rank))
-                p2p_ops.append(dist.P2POp(dist.isend, last_hs,  consumer_rank))
-                p2p_ops.append(dist.P2POp(dist.isend, ids_t,    consumer_rank))
-                p2p_ops.append(dist.P2POp(dist.isend, mask_t,   consumer_rank))
+                isend_works.append(dist.isend(aux_hs,   dst=consumer_rank))
+                isend_works.append(dist.isend(last_hs,  dst=consumer_rank))
+                isend_works.append(dist.isend(ids_t,    dst=consumer_rank))
+                isend_works.append(dist.isend(mask_t,   dst=consumer_rank))
                 total_sent_bytes += (aux_hs.nbytes + last_hs.nbytes +
                                      ids_t.nbytes + mask_t.nbytes)
-            works = dist.batch_isend_irecv(p2p_ops)
-            for work in works:
+            for work in isend_works:
                 work.wait()
 
             send_t = time.perf_counter() - t0
