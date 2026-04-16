@@ -238,7 +238,7 @@ def main():
     # DDP group: consumer-internal AllReduce via NVLink
     consumer_ranks = list(range(1, CONSUMER_DDP_SIZE + 1))
     ddp_group = dist.new_group(ranks=consumer_ranks, timeout=timedelta(hours=2))
-    model = DDP(model, process_group=ddp_group, device_ids=[local_rank])
+    model = DDP(model, process_group=ddp_group, device_ids=[local_rank], broadcast_buffers=False)
     log.info(f"DDP group initialized (ranks={consumer_ranks})")
 
     # Warmup
