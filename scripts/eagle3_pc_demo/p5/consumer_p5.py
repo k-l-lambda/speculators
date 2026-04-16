@@ -237,7 +237,7 @@ def main():
 
     # DDP group: consumer-internal AllReduce via NVLink
     consumer_ranks = list(range(1, CONSUMER_DDP_SIZE + 1))
-    ddp_group = dist.new_group(ranks=consumer_ranks)
+    ddp_group = dist.new_group(ranks=consumer_ranks, timeout=timedelta(hours=2))
     model = DDP(model, process_group=ddp_group, device_ids=[local_rank])
     log.info(f"DDP group initialized (ranks={consumer_ranks})")
 
@@ -262,8 +262,16 @@ def main():
             dist.recv(meta_recv, src=0)
             seq_len = int(meta_recv[0].item())
 
-            # Skip sentinel
+            # Skip sentinel — coordinate across ALL DDP ranks to avoid AllReduce deadlock
+            skip_flag = torch.zeros(1, dtype=torch.int32, device=device)
             if seq_len == -1:
+                skip_flag[0] = 1
+            dist.all_reduce(skip_flag, op=dist.ReduceOp.MAX, group=ddp_group)
+            if skip_flag.item() > 0:
+                log.info(f'step {global_step}: skip sentinel received (any rank), coordinating skip')
+                if is_chief:
+                    loss_send[0] = float('nan')
+                    dist.send(loss_send, dst=0)
                 global_step += 1
                 continue
 

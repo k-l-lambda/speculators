@@ -208,8 +208,9 @@ def main():
             results = generator.generate(all_input_ids)
             gen_t = time.perf_counter() - t0
 
-            # Prepare and send to each consumer rank
-            total_sent_bytes = 0
+            # Prepare all consumer payloads first (all-or-nothing: if any rank bad, skip ALL)
+            skip_batch = False
+            payloads = []  # (consumer_rank, seq_len, aux_hs, last_hs, ids_t, mask_t)
             for i, (result, raw, f) in enumerate(zip(results, batch_raw, batch_files)):
                 consumer_rank = i + 1
                 result_len = len(result["input_ids"])
@@ -218,21 +219,33 @@ def main():
                 if abs(result_len - disk_len) > 2:
                     log.warning(
                         f"round {global_round} rank {consumer_rank}: "
-                        f"length mismatch disk={disk_len} vllm={result_len}, sending skip"
+                        f"length mismatch disk={disk_len} vllm={result_len}, skipping whole batch"
                     )
-                    send_skip(consumer_rank, device)
-                    continue
+                    skip_batch = True
+                    break
 
                 try:
                     seq_len, aux_hs, last_hs, ids_t, mask_t = prepare_batch(
                         result, raw["loss_mask"], MAX_SEQ_LEN, device
                     )
+                    payloads.append((consumer_rank, seq_len, aux_hs, last_hs, ids_t, mask_t))
                 except Exception as e:
                     log.warning(f"round {global_round} rank {consumer_rank}: "
-                                f"prepare_batch failed: {e}, sending skip")
-                    send_skip(consumer_rank, device)
-                    continue
+                                f"prepare_batch failed: {e}, skipping whole batch")
+                    skip_batch = True
+                    break
 
+            if skip_batch:
+                # Send skip sentinel to ALL consumer ranks so DDP stays in sync
+                for r in range(1, CONSUMER_DDP_SIZE + 1):
+                    send_skip(r, device)
+                dist.recv(loss_recv, src=1)  # chief sends NaN loss on skip
+                global_round += 1
+                continue
+
+            # Send real data to each consumer rank
+            total_sent_bytes = 0
+            for consumer_rank, seq_len, aux_hs, last_hs, ids_t, mask_t in payloads:
                 meta_send[0] = seq_len
                 dist.send(meta_send, dst=consumer_rank)
                 dist.send(aux_hs,    dst=consumer_rank)   # [1, seq_len, 3H]
