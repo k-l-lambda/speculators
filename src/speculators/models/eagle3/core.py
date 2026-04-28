@@ -250,18 +250,11 @@ class Eagle3DraftModel(SpeculatorModel):
         self.hidden_size = config.transformer_layer_config.hidden_size
         self.draft_vocab_size = config.draft_vocab_size
 
-        # Verify that if one mapping tensor is provided, the other is as well
-        if (t2d is None) != (d2t is None):
-            raise ValueError(
-                "Both t2d and d2t must be provided together, or both must be None. "
-                f"Got t2d={'provided' if t2d is not None else 'None'}, "
-                f"d2t={'provided' if d2t is not None else 'None'}"
-            )
-
         # Register buffers - they can be None
         if t2d is not None:
             self.register_buffer("t2d", t2d)  # shape: [verifier_vocab_size], bool
-            if int(t2d.sum(dtype=torch.long).item()) != self.draft_vocab_size:
+            # Only validate t2d sum when d2t is not provided (legacy 1-to-1 mapping mode)
+            if d2t is None and int(t2d.sum(dtype=torch.long).item()) != self.draft_vocab_size:
                 raise ValueError(
                     f"t2d has {int(t2d.sum(dtype=torch.long).item())} non-zero values, "
                     f"expected {self.draft_vocab_size}."
@@ -389,8 +382,15 @@ class Eagle3DraftModel(SpeculatorModel):
             self.hidden_size, self.draft_vocab_size, bias=False
         )
 
-        if t2d is not None:
-            # Reduce to limited vocab
+        if self.d2t is not None:
+            # Use d2t abs indexing: supports many-to-1 draft->verifier mapping
+            # Use CPU for indexing since lm_head_weight is loaded on CPU
+            _d2t_cpu = self.d2t.cpu().to(torch.long)
+            _arange = torch.arange(self.d2t.shape[0], dtype=torch.long)
+            _d2t_abs = (_arange + _d2t_cpu).clamp(0, lm_head_weight.shape[0] - 1)
+            lm_head_weight = lm_head_weight.to(dtype=default_dtype)[_d2t_abs, :]
+        elif t2d is not None:
+            # Legacy 1-to-1 mapping via bool mask
             lm_head_weight = lm_head_weight.to(device=t2d.device, dtype=default_dtype)[
                 t2d.to(torch.bool), :
             ]

@@ -195,7 +195,7 @@ class MultipackDistributedBatchSamplerV2(Sampler):
             if self.rank == 0:
                 warnings.warn(msg, stacklevel=1)
 
-        self._cached_generated_batches = (-1, [])
+        self._cached_generated_batches = (None, [])
 
     def __iter__(self):
         batches = self._generate_batches(self.epoch)

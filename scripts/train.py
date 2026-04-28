@@ -186,19 +186,18 @@ def main(args: argparse.Namespace):
     device = torch.device(local_rank)
 
     # Load t2d and d2t tensors if provided
-    if args.d2t_path or args.t2d_path:
-        if not (args.d2t_path and args.t2d_path):
-            raise ValueError(
-                "Both t2d and d2t must be provided together, or both must be omitted. "
-                f"Got t2d={'provided' if args.t2d_path is not None else 'not provided'}"
-                f"d2t={'provided' if args.d2t_path is not None else 'not provided'}"
-            )
+    if args.d2t_path:
         d2t = torch.from_numpy(np.load(args.d2t_path)).to(device)
-        t2d = torch.from_numpy(np.load(args.t2d_path)).to(device)
         draft_vocab_size = d2t.shape[0]
     else:
         d2t = None
+    if args.t2d_path:
+        t2d = torch.from_numpy(np.load(args.t2d_path)).to(device)
+        if d2t is None:
+            draft_vocab_size = int(t2d.sum().item())
+    else:
         t2d = None
+    if d2t is None and t2d is None:
         # When vocab mapping is not provided, use the full verifier vocab
         verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path, trust_remote_code=True)
         if hasattr(verifier_config, "text_config"):

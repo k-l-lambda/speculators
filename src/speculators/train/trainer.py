@@ -241,6 +241,11 @@ class Trainer:
 
     def run_training(self):
         n_epochs = self.config.num_epochs
+        # Pre-training validation to verify initial model state before any gradient updates
+        if self.current_epoch == 0 and self.val_loader is not None:
+            root_logger.info("Pre-training validation (epoch -1) started")
+            self.val_epoch(-1)
+            root_logger.info("Pre-training validation (epoch -1) completed")
         for epoch in range(self.current_epoch, n_epochs):
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
             self.train_epoch(epoch)
