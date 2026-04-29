@@ -218,7 +218,8 @@ class MultipackDistributedBatchSamplerV2(Sampler):
         if self._cached_generated_batches[0] == epoch:
             return self._cached_generated_batches[1]
 
-        rng = np.random.default_rng(seed=self.seed + epoch)
+        rng_epoch = max(epoch, 0)
+        rng = np.random.default_rng(seed=self.seed + rng_epoch)
         indices = rng.permutation(self.valid_indices)
 
         batches = _assign_to_packed_batches(
