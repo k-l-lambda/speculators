@@ -255,6 +255,7 @@ def main(args: argparse.Namespace):
         scheduler_warmup_steps=args.scheduler_warmup_steps,
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
+        empty_init=args.pretrain_weights is None,
     )
 
     if args.dynamic:

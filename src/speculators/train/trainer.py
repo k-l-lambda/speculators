@@ -41,6 +41,7 @@ class TrainerConfig(NamedTuple):
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
     max_checkpoints: int | None = None
+    empty_init: bool = True
 
 
 class Trainer:
@@ -92,11 +93,11 @@ class Trainer:
         SpeculatorModel.verify_training_compatible(self.model)
 
         if self.is_distributed:
-            apply_fully_sharded(self.model)
+            apply_fully_sharded(self.model, empty_init=self.config.empty_init)
 
             if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
                 self.checkpointer.load_model_state_dict(self.model)
-            else:
+            elif self.config.empty_init:
                 for m in self.model.layers.children():  # type: ignore[union-attr]
                     if not isinstance(m, FSDPModule):
                         continue

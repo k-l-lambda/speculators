@@ -54,7 +54,7 @@ def maybe_destroy_distributed():
     )
 
 
-def apply_fully_sharded(model: torch.nn.Module):
+def apply_fully_sharded(model: torch.nn.Module, empty_init: bool = True):
     """Applies torch FSDP fully_shard to the model, wrapping layers in FSDPModule.
 
     Assumes the model has a `layers` attribute containing the decoder layers.
@@ -68,7 +68,8 @@ def apply_fully_sharded(model: torch.nn.Module):
 
     for layer in model.layers:  # type: ignore[union-attr]
         # we apply fully_shard to each DecoderLayer
-        layer.to_empty(device="meta")
+        if empty_init:
+            layer.to_empty(device="meta")
         fully_shard(layer, mp_policy=mp_policy)
 
     fully_shard(model)
