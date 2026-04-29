@@ -483,8 +483,8 @@ def parse_args():
     parser.add_argument(
         "--norm-before-residual",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Toggle normalization before residual connections (default: True)",
+        default=False,
+        help="Toggle normalization before residual connections (default: False; matches vLLM when draft config omits it)",
     )
     parser.add_argument(
         "--embed-requires-grad",
