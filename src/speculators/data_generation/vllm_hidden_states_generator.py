@@ -1,5 +1,7 @@
 """Extract hidden states from intermediate layers during prefill using vLLM."""
 
+import inspect
+
 import torch
 from transformers import AutoConfig, AutoTokenizer
 from vllm.config import (
@@ -87,7 +89,7 @@ class VllmHiddenStatesGenerator:
         log.info(f"Initializing hidden states generator for {model_path}")
         log.info(f"Tensor parallel size: {tensor_parallel_size}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if hasattr(config, "num_hidden_layers"):
@@ -261,17 +263,24 @@ class VllmHiddenStatesGenerator:
             request_id_to_idx[req_id] = i
             request_id_to_prompt_len[req_id] = len(ids_list)
 
-            req = Request(
-                request_id=req_id,
-                prompt_token_ids=ids_list,
-                sampling_params=SamplingParams(
+            request_kwargs = {
+                "request_id": req_id,
+                "prompt_token_ids": ids_list,
+                "sampling_params": SamplingParams(
                     max_tokens=MAX_DECODE_TOKENS, temperature=SAMPLING_TEMPERATURE
                 ),
-                pooling_params=None,
-                eos_token_id=self.tokenizer.eos_token_id,
-                arrival_time=INITIAL_ARRIVAL_TIME,
-                block_hasher=self.block_hasher,
-            )
+                "pooling_params": None,
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "arrival_time": INITIAL_ARRIVAL_TIME,
+                "block_hasher": self.block_hasher,
+            }
+            request_params = inspect.signature(Request).parameters
+            request_kwargs = {
+                key: value
+                for key, value in request_kwargs.items()
+                if key in request_params
+            }
+            req = Request(**request_kwargs)
             self.scheduler.add_request(req)
 
         # Increment to ensure unique request IDs across calls
