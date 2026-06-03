@@ -249,15 +249,11 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
     )
 
     def __init__(self, **kwargs):
-        # initialize the Pydantic arguments first to set all valid fields
-        PydanticClassRegistryMixin.__init__(self, **kwargs)
+        # initialize Pydantic BaseModel fields first to ensure __pydantic_fields_set__ exists
+        # before PretrainedConfig.__init__ can trigger Pydantic's __setattr__ hook
+        BaseModel.__init__(self, **kwargs)
 
-        # ensure __pydantic_fields_set__ exists before PretrainedConfig.__init__
-        # (PretrainedConfig.setattr triggers Pydantic.__setattr__ which needs it)
-        if not hasattr(self, '__pydantic_fields_set__'):
-            object.__setattr__(self, '__pydantic_fields_set__', set())
-
-        # reset kwargs handled by Pydantic so PretrainedConfig doesn't override
+        # reset kwargs with validated Pydantic values so PretrainedConfig uses them
         for field in self.__class__.model_fields:
             kwargs[field] = getattr(self, field)
 
