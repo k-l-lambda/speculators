@@ -94,15 +94,18 @@ def setup_dataloader(
         num_replicas=world_size,
         rank=local_rank,
     )
-    return DataLoader(
-        dataset,
-        batch_sampler=batch_sampler,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor,
-        pin_memory=True,
-        collate_fn=create_collate_fn(args.total_seq_len),
-        persistent_workers=True,
-    )
+    dataloader_kwargs = {
+        "dataset": dataset,
+        "batch_sampler": batch_sampler,
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "collate_fn": create_collate_fn(args.total_seq_len),
+    }
+    # prefetch_factor and persistent_workers only valid with num_workers > 0
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = prefetch_factor
+        dataloader_kwargs["persistent_workers"] = True
+    return DataLoader(**dataloader_kwargs)
 
 
 def create_transformer_layer_config(
