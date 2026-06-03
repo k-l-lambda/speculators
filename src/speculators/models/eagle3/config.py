@@ -74,6 +74,8 @@ class Eagle3SpeculatorConfig(SpeculatorModelConfig):
     @classmethod
     def validate_transformer_config(cls, value: Any) -> PretrainedConfig:
         """Validate and convert transformer config."""
+        if isinstance(value, PretrainedConfig):
+            return value
         if isinstance(value, dict):
             config_class: type[PretrainedConfig] = LlamaConfig
             if "model_type" in value:
@@ -81,4 +83,7 @@ class Eagle3SpeculatorConfig(SpeculatorModelConfig):
                     model_type=value["model_type"]
                 ).__class__
             return config_class(**value)
-        return value
+        raise TypeError(
+            f"transformer_layer_config must be PretrainedConfig or dict, "
+            f"got {type(value).__name__}"
+        )
