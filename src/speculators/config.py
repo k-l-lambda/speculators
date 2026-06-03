@@ -22,6 +22,7 @@ import os
 from importlib.metadata import version
 from typing import Any, ClassVar
 
+import torch
 from pydantic import BaseModel, ConfigDict, Field
 from transformers import PretrainedConfig
 
