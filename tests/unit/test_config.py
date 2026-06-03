@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 from transformers import PretrainedConfig
+from transformers.models.llama.configuration_llama import LlamaConfig
 
 from speculators import (
     SpeculatorModelConfig,
@@ -19,6 +20,7 @@ from speculators import (
     VerifierConfig,
     reload_schemas,
 )
+from speculators.models.eagle3 import Eagle3SpeculatorConfig
 
 # ===== TokenProposalConfig Tests =====
 
@@ -376,6 +378,43 @@ def test_speculator_model_config_from_pretrained_local_marshalling(
         assert reloaded_config.speculators_model_type == "test_model"
         assert reloaded_config.speculators_config.algorithm == "test_algorithm"
         assert reloaded_config.test_field == 678
+
+
+@pytest.mark.smoke
+def test_eagle3_speculator_config_pretrained_roundtrip(sample_speculators_config):
+    config = Eagle3SpeculatorConfig(
+        transformer_layer_config=LlamaConfig(
+            vocab_size=163840,
+            hidden_size=7168,
+            intermediate_size=18432,
+            num_hidden_layers=1,
+            num_attention_heads=56,
+            num_key_value_heads=56,
+        ),
+        draft_vocab_size=163840,
+        norm_before_residual=False,
+        embed_requires_grad=False,
+        speculators_config=sample_speculators_config,
+    )
+
+    config_dict = config.to_dict()
+    assert config_dict["speculators_model_type"] == "eagle3"
+    assert config_dict["draft_vocab_size"] == 163840
+
+    diff_dict = config.to_diff_dict()
+    assert diff_dict["speculators_model_type"] == "eagle3"
+    assert diff_dict["draft_vocab_size"] == 163840
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        temp_path = Path(tmp_dir)
+        config.save_pretrained(temp_path)
+        assert (temp_path / "config.json").exists()
+
+        reloaded_config = SpeculatorModelConfig.from_pretrained(temp_path)
+        assert isinstance(reloaded_config, Eagle3SpeculatorConfig)
+        assert reloaded_config.speculators_model_type == "eagle3"
+        assert reloaded_config.draft_vocab_size == 163840
+        assert isinstance(reloaded_config.transformer_layer_config, LlamaConfig)
 
 
 @pytest.mark.smoke
