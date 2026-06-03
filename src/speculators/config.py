@@ -23,7 +23,7 @@ from importlib.metadata import version
 from typing import Any, ClassVar
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PydanticUserError
 from transformers import PretrainedConfig
 
 from speculators.proposals import TokenProposalConfig
@@ -270,7 +270,13 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
             PretrainedConfig variables and Pydantic model fields.
         """
         pretrained_dict = super().to_dict()
-        model_dict = self.model_dump()
+        try:
+            model_dict = self.model_dump()
+        except PydanticUserError as exc:
+            if exc.code != "class-not-fully-defined":
+                raise
+            self.__class__.model_rebuild(force=True, _types_namespace={"torch": torch})
+            model_dict = self.model_dump()
         config_dict = {**pretrained_dict, **model_dict}
 
         # strip all class variables and metadata that are not needed in the output

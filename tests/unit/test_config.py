@@ -417,6 +417,13 @@ def test_eagle3_speculator_config_pretrained_roundtrip(sample_speculators_config
         assert isinstance(reloaded_config.transformer_layer_config, LlamaConfig)
 
 
+def test_eagle3_speculator_config_default_to_dict_rebuilds_schema():
+    config = Eagle3SpeculatorConfig()
+    config_dict = config.to_dict()
+    assert config_dict["speculators_model_type"] == "eagle3"
+    assert config_dict["draft_vocab_size"] == 32000
+
+
 @pytest.mark.smoke
 def test_speculator_model_config_from_pretrained_hf_hub(sample_speculators_config):
     config_data = {
