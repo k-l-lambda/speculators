@@ -249,30 +249,22 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
     )
 
     def __init__(self, **kwargs):
-        # explicitly initialize Pydantic internal state BEFORE PretrainedConfig tries to setattr
-        # Pydantic v2 requires __pydantic_fields_set__ to exist before __setattr__ is called
-        object.__setattr__(self, '__pydantic_fields_set__', set())
-        object.__setattr__(self, '__pydantic_extra__', {})
-        object.__setattr__(self, '__pydantic_private__', None)
-
-        # initialize BaseModel validation to populate model fields
+        # initialize BaseModel validation FIRST to populate model fields from Pydantic
         BaseModel.__init__(self, **kwargs)
 
-        # reset kwargs with validated Pydantic values so PretrainedConfig uses them
+        # bypass PretrainedConfig.__init__ setattr calls that trigger Pydantic's __setattr__
+        # by directly setting attributes using object.__setattr__ instead
         for field in self.__class__.model_fields:
-            kwargs[field] = getattr(self, field)
+            value = getattr(self, field)
+            object.__setattr__(self, field, value)
 
-        # strip ClassVars so PretrainedConfig.__init__ doesn't try to setattr them
-        # (pydantic blocks setattr on ClassVar names, causing AttributeError)
-        class_vars = self.__class__.__class_vars__
-        for cv in class_vars:
-            kwargs.pop(cv, None)
-
-        # initialize the Hugging Face PretrainedConfig arguments for the model
-        PretrainedConfig.__init__(self, **kwargs)
-
-        # ensure we always update the transformers version
+        # manually set PretrainedConfig attributes that __init__ would normally set
+        # (use object.__setattr__ to bypass Pydantic's __setattr__ hook)
         object.__setattr__(self, 'transformers_version', version("transformers"))
+
+        # set PretrainedConfig class attributes if not already set
+        if not hasattr(self, '_processor_class'):
+            object.__setattr__(self, '_processor_class', None)
 
     def to_dict(self) -> dict[str, Any]:
         """
