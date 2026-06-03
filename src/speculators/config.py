@@ -249,8 +249,13 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
     )
 
     def __init__(self, **kwargs):
-        # initialize Pydantic BaseModel fields first to ensure __pydantic_fields_set__ exists
-        # before PretrainedConfig.__init__ can trigger Pydantic's __setattr__ hook
+        # explicitly initialize Pydantic internal state BEFORE PretrainedConfig tries to setattr
+        # Pydantic v2 requires __pydantic_fields_set__ to exist before __setattr__ is called
+        object.__setattr__(self, '__pydantic_fields_set__', set())
+        object.__setattr__(self, '__pydantic_extra__', {})
+        object.__setattr__(self, '__pydantic_private__', None)
+
+        # initialize BaseModel validation to populate model fields
         BaseModel.__init__(self, **kwargs)
 
         # reset kwargs with validated Pydantic values so PretrainedConfig uses them
