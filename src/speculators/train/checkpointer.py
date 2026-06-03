@@ -105,9 +105,11 @@ class BaseCheckpointer:
         for d in self.path.iterdir():
             if d.is_dir():
                 try:
-                    last_checkpoint_num = max(last_checkpoint_num, int(d.name))
+                    epoch_num = int(d.name)
                 except ValueError:
                     continue
+                if (d / "model.safetensors").exists() or (d / "model.safetensors.index.json").exists():
+                    last_checkpoint_num = max(last_checkpoint_num, epoch_num)
         return last_checkpoint_num
 
     def model_path(self, epoch: int):
