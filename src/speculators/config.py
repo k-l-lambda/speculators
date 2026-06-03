@@ -256,6 +256,12 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         for field in self.__class__.model_fields:
             kwargs[field] = getattr(self, field)
 
+        # strip ClassVars so PretrainedConfig.__init__ doesn't try to setattr them
+        # (pydantic blocks setattr on ClassVar names, causing AttributeError)
+        class_vars = self.__class__.__class_vars__
+        for cv in class_vars:
+            kwargs.pop(cv, None)
+
         # initialize the Hugging Face PretrainedConfig arguments for the model
         PretrainedConfig.__init__(self, **kwargs)
 
