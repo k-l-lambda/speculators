@@ -248,23 +248,21 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         ),
     )
 
+    def __new__(cls, **kwargs):
+        # create instance without calling __init__ yet
+        instance = object.__new__(cls)
+        # pre-initialize Pydantic internal state BEFORE any __init__ runs
+        object.__setattr__(instance, '__pydantic_fields_set__', set())
+        object.__setattr__(instance, '__pydantic_extra__', None)
+        object.__setattr__(instance, '__pydantic_private__', None)
+        return instance
+
     def __init__(self, **kwargs):
-        # initialize BaseModel validation FIRST to populate model fields from Pydantic
+        # now safe to call BaseModel.__init__ with __pydantic_fields_set__ already present
         BaseModel.__init__(self, **kwargs)
 
-        # bypass PretrainedConfig.__init__ setattr calls that trigger Pydantic's __setattr__
-        # by directly setting attributes using object.__setattr__ instead
-        for field in self.__class__.model_fields:
-            value = getattr(self, field)
-            object.__setattr__(self, field, value)
-
-        # manually set PretrainedConfig attributes that __init__ would normally set
-        # (use object.__setattr__ to bypass Pydantic's __setattr__ hook)
+        # manually set PretrainedConfig attributes
         object.__setattr__(self, 'transformers_version', version("transformers"))
-
-        # set PretrainedConfig class attributes if not already set
-        if not hasattr(self, '_processor_class'):
-            object.__setattr__(self, '_processor_class', None)
 
     def to_dict(self) -> dict[str, Any]:
         """
