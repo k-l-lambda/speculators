@@ -266,13 +266,19 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         # now safe to call BaseModel.__init__ with __pydantic_fields_set__ already present
         BaseModel.__init__(self, **kwargs)
 
-        # Materialize any field still holding its class-level ``FieldInfo``. With
-        # some pydantic builds the custom ``__new__`` (which pre-seeds
-        # ``__pydantic_fields_set__``) causes ``BaseModel.__init__`` to skip
-        # applying defaults for unset fields, so ``getattr`` returns the
-        # FieldInfo descriptor. That later leaks into ``to_dict``/``to_diff_dict``
-        # and breaks JSON/serialization in ``save_pretrained``. Resolve each
-        # unset field to its real default (default or default_factory).
+    def model_post_init(self, __context) -> None:
+        # Runs for every subclass after validation (Pydantic calls it even when a
+        # subclass like Eagle3SpeculatorConfig has a synthetic __init__ that
+        # shadows this class's __init__ — so the materialization below must live
+        # here, not in __init__).
+        #
+        # Materialize any field still holding its class-level ``FieldInfo``. The
+        # custom ``__new__`` pre-seeds ``__pydantic_fields_set__`` which causes
+        # Pydantic to skip applying defaults for unset fields, so ``getattr``
+        # returns the FieldInfo descriptor. That later leaks into
+        # ``to_dict``/``to_diff_dict`` and breaks JSON serialization in
+        # ``save_pretrained`` ("Object of type FieldInfo is not JSON
+        # serializable"). Resolve each unset field to its real default.
         from pydantic_core import PydanticUndefined
 
         for name, field in type(self).model_fields.items():
@@ -285,6 +291,7 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
                 else:
                     default = None
                 object.__setattr__(self, name, default)
+                self.__pydantic_fields_set__.add(name)
 
         # manually set PretrainedConfig attributes
         object.__setattr__(self, 'transformers_version', version("transformers"))
