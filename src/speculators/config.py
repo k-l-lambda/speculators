@@ -310,11 +310,38 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         for validator in getattr(type(self), "__class_validators__", ()):  # type: ignore[attr-defined]
             validator(self)
 
+    def _materialize_field_defaults(self) -> None:
+        """Resolve any field still holding its class-level ``FieldInfo``.
+
+        The custom ``__new__`` pre-seeds ``__pydantic_fields_set__``/``__pydantic_extra__``
+        which makes Pydantic's ``validate_python`` take a fast path that skips
+        applying defaults for unset fields (and skips ``__init__``/``model_post_init``
+        for subclasses with a synthetic ``__init__``). Unset fields then return
+        their ``FieldInfo`` descriptor via ``getattr`` and leak into serialization,
+        breaking ``save_pretrained`` with "Object of type FieldInfo is not JSON
+        serializable". Call this at the start of ``to_dict`` so both the real
+        instance and the bare ``self.__class__()`` default instance transformers
+        builds for diffing are sanitized.
+        """
+        from pydantic_core import PydanticUndefined
+
+        for name, field in type(self).model_fields.items():
+            if isinstance(getattr(self, name, None), FieldInfo):
+                if field.default_factory is not None:
+                    default = field.default_factory()  # type: ignore[call-arg]
+                elif field.default is not PydanticUndefined:
+                    default = field.default
+                else:
+                    default = None
+                object.__setattr__(self, name, default)
+                self.__pydantic_fields_set__.add(name)
+
     def to_dict(self) -> dict[str, Any]:
         """
         :return: A dictionary representation of the full config, including the
             PretrainedConfig variables and Pydantic model fields.
         """
+        self._materialize_field_defaults()
         pretrained_dict = super().to_dict()
         try:
             model_dict = self.model_dump()
