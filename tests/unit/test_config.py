@@ -433,6 +433,16 @@ def test_eagle3_speculator_config_bare_default_serializes_transformer_config():
     assert isinstance(config_dict["transformer_layer_config"], dict)
 
 
+def test_eagle3_speculator_config_allows_extra_attr_assignment():
+    # model_config sets extra="allow"; transformers' custom_object_save assigns
+    # ``auto_map`` (an unknown field) which routes to __pydantic_extra__[name].
+    # __pydantic_extra__ must be a dict, not None, or this raises
+    # "'NoneType' object does not support item assignment".
+    config = Eagle3SpeculatorConfig()
+    config.auto_map = {"AutoConfig": "configuration_eagle3.Eagle3SpeculatorConfig"}
+    assert config.auto_map["AutoConfig"].endswith("Eagle3SpeculatorConfig")
+
+
 @pytest.mark.smoke
 def test_speculator_model_config_from_pretrained_hf_hub(sample_speculators_config):
     config_data = {

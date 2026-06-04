@@ -253,7 +253,11 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         instance = object.__new__(cls)
         # pre-initialize Pydantic internal state BEFORE any __init__ runs
         object.__setattr__(instance, '__pydantic_fields_set__', set())
-        object.__setattr__(instance, '__pydantic_extra__', None)
+        # model_config sets extra="allow", so __pydantic_extra__ must be a dict
+        # (None is only valid for extra="ignore"/"forbid"). transformers' save
+        # path assigns unknown attrs like ``auto_map`` which route through
+        # __pydantic_extra__[name] = value and would fail on None.
+        object.__setattr__(instance, '__pydantic_extra__', {})
         object.__setattr__(instance, '__pydantic_private__', None)
         return instance
 
