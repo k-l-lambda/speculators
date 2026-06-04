@@ -67,8 +67,20 @@ class Eagle3SpeculatorConfig(SpeculatorModelConfig):
 
     @field_serializer("transformer_layer_config")
     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
-        """Serialize transformer config to dict."""
-        return value.to_diff_dict()
+        """Serialize transformer config to dict.
+
+        ``value`` is normally a ``PretrainedConfig``. When transformers builds a
+        bare ``Eagle3SpeculatorConfig()`` (e.g. ``_get_generation_parameters``
+        constructing a defaults instance for diffing), the field can still hold
+        its unresolved ``FieldInfo`` default; fall back to the default factory so
+        serialization does not crash with ``'FieldInfo' object has no attribute
+        'to_diff_dict'``.
+        """
+        if hasattr(value, "to_diff_dict"):
+            return value.to_diff_dict()
+        if isinstance(value, dict):
+            return value
+        return LlamaConfig().to_diff_dict()
 
     @field_validator("transformer_layer_config", mode="before")
     @classmethod

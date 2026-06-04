@@ -424,6 +424,15 @@ def test_eagle3_speculator_config_default_to_dict_rebuilds_schema():
     assert config_dict["draft_vocab_size"] == 32000
 
 
+def test_eagle3_speculator_config_bare_default_serializes_transformer_config():
+    # transformers save_pretrained builds a bare ``__class__()`` for generation
+    # parameter diffing; the transformer_layer_config field can hold its
+    # unresolved FieldInfo default, which previously crashed the serializer with
+    # "'FieldInfo' object has no attribute 'to_diff_dict'".
+    config_dict = Eagle3SpeculatorConfig().__class__().to_dict()
+    assert isinstance(config_dict["transformer_layer_config"], dict)
+
+
 @pytest.mark.smoke
 def test_speculator_model_config_from_pretrained_hf_hub(sample_speculators_config):
     config_data = {
