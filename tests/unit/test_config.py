@@ -443,6 +443,13 @@ def test_eagle3_speculator_config_allows_extra_attr_assignment():
     assert config.auto_map["AutoConfig"].endswith("Eagle3SpeculatorConfig")
 
 
+def test_eagle3_speculator_config_validate_is_instance_method():
+    # transformers>=5 save_pretrained calls self.validate(); the MRO must not
+    # resolve to Pydantic's deprecated BaseModel.validate(value) classmethod
+    # (which crashes with "missing 1 required positional argument: 'value'").
+    Eagle3SpeculatorConfig().validate()
+
+
 @pytest.mark.smoke
 def test_speculator_model_config_from_pretrained_hf_hub(sample_speculators_config):
     config_data = {

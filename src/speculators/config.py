@@ -268,6 +268,20 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         # manually set PretrainedConfig attributes
         object.__setattr__(self, 'transformers_version', version("transformers"))
 
+    def validate(self) -> None:
+        """transformers PretrainedConfig.validate() hook.
+
+        transformers>=5 calls ``self.validate()`` during ``save_pretrained`` to
+        run strict-dataclass class validators. Because this config also subclasses
+        Pydantic ``BaseModel``, the MRO would otherwise resolve ``.validate`` to
+        Pydantic's deprecated ``BaseModel.validate(value)`` classmethod and crash
+        with "missing 1 required positional argument: 'value'". Pydantic already
+        validates on construction, so run any transformers class validators if
+        present and otherwise no-op.
+        """
+        for validator in getattr(type(self), "__class_validators__", ()):  # type: ignore[attr-defined]
+            validator(self)
+
     def to_dict(self) -> dict[str, Any]:
         """
         :return: A dictionary representation of the full config, including the
