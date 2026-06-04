@@ -24,6 +24,7 @@ from typing import Any, ClassVar
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, PydanticUserError
+from pydantic.fields import FieldInfo
 from transformers import PretrainedConfig
 
 from speculators.proposals import TokenProposalConfig
@@ -264,6 +265,26 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
     def __init__(self, **kwargs):
         # now safe to call BaseModel.__init__ with __pydantic_fields_set__ already present
         BaseModel.__init__(self, **kwargs)
+
+        # Materialize any field still holding its class-level ``FieldInfo``. With
+        # some pydantic builds the custom ``__new__`` (which pre-seeds
+        # ``__pydantic_fields_set__``) causes ``BaseModel.__init__`` to skip
+        # applying defaults for unset fields, so ``getattr`` returns the
+        # FieldInfo descriptor. That later leaks into ``to_dict``/``to_diff_dict``
+        # and breaks JSON/serialization in ``save_pretrained``. Resolve each
+        # unset field to its real default (default or default_factory).
+        from pydantic_core import PydanticUndefined
+
+        for name, field in type(self).model_fields.items():
+            current = getattr(self, name, None)
+            if isinstance(current, FieldInfo):
+                if field.default_factory is not None:
+                    default = field.default_factory()  # type: ignore[call-arg]
+                elif field.default is not PydanticUndefined:
+                    default = field.default
+                else:
+                    default = None
+                object.__setattr__(self, name, default)
 
         # manually set PretrainedConfig attributes
         object.__setattr__(self, 'transformers_version', version("transformers"))

@@ -450,6 +450,27 @@ def test_eagle3_speculator_config_validate_is_instance_method():
     Eagle3SpeculatorConfig().validate()
 
 
+def test_eagle3_speculator_config_bare_default_has_no_fieldinfo_leak():
+    # With some pydantic builds the custom __new__ caused BaseModel.__init__ to
+    # skip default application, leaving fields holding their class-level
+    # FieldInfo. That leaked into to_diff_dict / to_json_string and crashed
+    # save_pretrained with "Object of type FieldInfo is not JSON serializable".
+    from pydantic.fields import FieldInfo
+
+    config = Eagle3SpeculatorConfig()
+    for name in (
+        "eagle_aux_hidden_state_layer_ids",
+        "embed_requires_grad",
+        "draft_vocab_size",
+        "target_hidden_size",
+        "norm_before_residual",
+        "architectures",
+    ):
+        assert not isinstance(getattr(config, name), FieldInfo), name
+    # the exact call that crashed in transformers save_pretrained
+    assert config.to_json_string(use_diff=True)
+
+
 @pytest.mark.smoke
 def test_speculator_model_config_from_pretrained_hf_hub(sample_speculators_config):
     config_data = {
