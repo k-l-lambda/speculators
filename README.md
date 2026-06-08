@@ -45,6 +45,22 @@ ______________________________________________________________________
 > [!TIP]
 > Read more about Speculators features in this [vLLM blog post](https://blog.vllm.ai/2025/12/13/speculators-v030.html).
 
+## Fork Notes (novitalabs/develop)
+
+> This `develop` branch is a fork of `vllm-project/speculators` maintained for
+> **online, cross-node training-data generation**. Unlike upstream, it retains
+> the in-process `VllmHiddenStatesGenerator`
+> (`src/speculators/data_generation/vllm_hidden_states_generator.py`), which
+> upstream removed in PR #433 when it moved to a disk-only offline
+> `.safetensors` pipeline. The in-process generator gives us a live hook on
+> hidden states so they can be streamed node-to-node over **RDMA (Mooncake)**
+> with a Redis Streams control plane, instead of being written to and read back
+> from disk. This is the one capability the upstream offline model does not
+> provide; the cost is that the generator couples to private `vllm.v1.*` APIs
+> and is hand-ported on each vLLM bump. See
+> [Online Cross-Node Data Generation over RDMA](docs/online_datagen_rdma.md)
+> for the full rationale and the upstream-vs-fork trade-off.
+
 ## Supported Models
 
 The following table summarizes the models that have been trained end-to-end by our team as well as others in the roadmap:
